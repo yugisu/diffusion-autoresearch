@@ -131,7 +131,8 @@ LOOP FOREVER (until R@1 ≥ 0.10 or manually interrupted):
 3. Edit `train.py` — changes can be large and exploratory, especially early on.
 4. `git commit` the change.
 5. `git push origin HEAD` — push immediately so results are visible upstream.
-6. `uv run train.py > run.log 2>&1`
+6. Run training **in the background** (a full run exceeds the foreground tool timeout):
+   `uv run train.py > run.log 2>&1` with `run_in_background=true`. Wait for the completion notification.
 7. Extract metrics: `grep "^R@1:\|^R@5:\|^elapsed_s:" run.log`
 8. If grep is empty → crash. Read `tail -n 50 run.log`, fix if trivial, otherwise log as crash and discard.
 9. Log to `results.tsv`.
@@ -140,6 +141,6 @@ LOOP FOREVER (until R@1 ≥ 0.10 or manually interrupted):
 
 **Halt condition**: When R@1 ≥ 0.10 is first reached, log it, push, and stop. Print a clear summary of what worked.
 
-**Timeout**: If a run exceeds 14 minutes total, kill it and treat as crash.
+**Timeout**: If a background run exceeds 14 minutes without completing, kill it with `pkill -f "uv run train.py"` and treat as crash.
 
 If you run out of ideas: re-read the prior CSVs, look for near-misses in your own results.tsv, try combinations of things that individually helped a little.
