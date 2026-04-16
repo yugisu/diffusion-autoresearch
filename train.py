@@ -132,9 +132,11 @@ _img_transform = transforms.Compose([
 # Feature extraction helpers
 # ---------------------------------------------------------------------------
 
-def gem_pool(x: torch.Tensor, p: float = 3.0, eps: float = 1e-6) -> torch.Tensor:
-    """Generalised Mean Pooling: (B, C, H, W) → (B, C)."""
-    return F.avg_pool2d(x.clamp(min=eps).pow(p), x.shape[-2:]).pow(1.0 / p).flatten(1)
+def pool_features(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """Avg + max pooling concat: (B, C, H, W) → (B, 2C). Complementary signals."""
+    avg = F.avg_pool2d(x, x.shape[-2:]).flatten(1)          # (B, C)
+    mx  = F.max_pool2d(x, x.shape[-2:]).flatten(1)           # (B, C)
+    return torch.cat([avg, mx], dim=1)                        # (B, 2C)
 
 
 @torch.inference_mode()
@@ -157,7 +159,7 @@ def extract_features(dataloader: DataLoader) -> np.ndarray:
             noise_pred = unet(z, t_tensor, encoder_hidden_states=pe_cache).sample
 
             if step_idx in COLLECT:
-                vecs = [gem_pool(_features[k]) for k in sorted(_features)]
+                vecs = [pool_features(_features[k]) for k in sorted(_features)]
                 collected.append(torch.cat(vecs, dim=1).float())
 
             # DDIM inversion step: z_t → z_{t_next}
