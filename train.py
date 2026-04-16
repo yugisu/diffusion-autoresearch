@@ -133,10 +133,19 @@ _img_transform = transforms.Compose([
 # ---------------------------------------------------------------------------
 
 def pool_features(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-    """Avg + max pooling concat: (B, C, H, W) → (B, 2C). Complementary signals."""
-    avg = F.avg_pool2d(x, x.shape[-2:]).flatten(1)          # (B, C)
-    mx  = F.max_pool2d(x, x.shape[-2:]).flatten(1)           # (B, C)
-    return torch.cat([avg, mx], dim=1)                        # (B, 2C)
+    """Spatial pyramid: global avg+max + 2×2 grid avg+max → (B, 10C)."""
+    B, C, H, W = x.shape
+    parts = [
+        F.avg_pool2d(x, (H, W)).flatten(1),   # global avg
+        F.max_pool2d(x, (H, W)).flatten(1),   # global max
+    ]
+    h2, w2 = H // 2, W // 2
+    for i in range(2):
+        for j in range(2):
+            tile = x[:, :, i*h2:(i+1)*h2, j*w2:(j+1)*w2]
+            parts.append(F.avg_pool2d(tile, tile.shape[-2:]).flatten(1))
+            parts.append(F.max_pool2d(tile, tile.shape[-2:]).flatten(1))
+    return torch.cat(parts, dim=1)             # (B, 10C)
 
 
 @torch.inference_mode()
