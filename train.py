@@ -214,7 +214,7 @@ chunk_bboxes = sat_ds.chunk_bboxes
 # ---------------------------------------------------------------------------
 
 PCA_REMOVE = 16   # number of leading PCA components to discard
-PCA_KEEP   = 512  # total output dims after whitening
+PCA_KEEP   = 1024 # total output dims after whitening (testing: 512 may be too aggressive)
 
 print(f"Applying PCA whitening: remove top {PCA_REMOVE}, keep {PCA_KEEP} dims...")
 all_embs = np.concatenate([uav_embs, sat_embs], axis=0)
