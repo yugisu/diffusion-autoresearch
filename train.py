@@ -37,8 +37,8 @@ from transformers import CLIPTextModel, CLIPTokenizer
 # Config (edit these freely — this is the only file you modify)
 # ---------------------------------------------------------------------------
 
-BATCH_SIZE = 16
-IMG_SIZE   = 256
+BATCH_SIZE = 8
+IMG_SIZE   = 512
 DDIM_STEPS = 10
 # Original framework: save_timesteps=[8,7] means cur_t = num_steps-1-i,
 # so cur_t=8→i=1 (t=1), cur_t=7→i=2 (t=101). Our step_idx maps directly:
