@@ -1,389 +1,252 @@
 """
-One-time data preparation for autoresearch experiments.
-Downloads data shards and trains a BPE tokenizer.
+Fixed VPR evaluation harness for diffusion-autoresearch.
+Provides dataset classes and the Recall@1/5/10 evaluation. DO NOT MODIFY.
 
-Usage:
-    python prepare.py                  # full prep (download + tokenizer)
-    python prepare.py --num-shards 8   # download only 8 shards (for testing)
-
-Data and tokenizer are stored in ~/.cache/autoresearch/.
+Usage (one-time sanity check): uv run prepare.py
 """
 
 import os
-import sys
-import time
-import math
-import argparse
-import pickle
-from multiprocessing import Pool
+from pathlib import Path
 
-import requests
-import pyarrow.parquet as pq
-import rustbpe
-import tiktoken
-import torch
+import numpy as np
+import pandas as pd
+import rasterio
+from PIL import Image
+from rasterio.enums import Resampling
+from rasterio.merge import merge as rasterio_merge
+from torch.utils.data import Dataset
 
 # ---------------------------------------------------------------------------
-# Constants (fixed, do not modify)
+# Constants (fixed — do not modify)
 # ---------------------------------------------------------------------------
 
-MAX_SEQ_LEN = 2048       # context length
-TIME_BUDGET = 300        # training time budget in seconds (5 minutes)
-EVAL_TOKENS = 40 * 524288  # number of tokens for val eval
+VISLOC_ROOT = Path("/workspace/data/visloc")
+HF_HOME = "/workspace/.hugging_face"
+FLIGHT_ID = "03"
+TIME_BUDGET = 720  # seconds (12 minutes wall-clock budget per experiment)
+
+# Satellite gallery config — fixed for fair comparison across runs.
+# These define the retrieval database: 2860 chunks at 512px with 128-px stride.
+CHUNK_PIXELS = 512
+CHUNK_STRIDE = 128
+MAP_SCALE_FACTOR = 0.25
+
+os.environ["HF_HOME"] = HF_HOME
 
 # ---------------------------------------------------------------------------
-# Configuration
+# Dataset classes
 # ---------------------------------------------------------------------------
 
-CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "autoresearch")
-DATA_DIR = os.path.join(CACHE_DIR, "data")
-TOKENIZER_DIR = os.path.join(CACHE_DIR, "tokenizer")
-BASE_URL = "https://huggingface.co/datasets/karpathy/climbmix-400b-shuffle/resolve/main"
-MAX_SHARD = 6542 # the last datashard is shard_06542.parquet
-VAL_SHARD = MAX_SHARD  # pinned validation shard (shard_06542)
-VAL_FILENAME = f"shard_{VAL_SHARD:05d}.parquet"
-VOCAB_SIZE = 8192
-
-# BPE split pattern (GPT-4 style, with \p{N}{1,2} instead of {1,3})
-SPLIT_PATTERN = r"""'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}{1,2}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+"""
-
-SPECIAL_TOKENS = [f"<|reserved_{i}|>" for i in range(4)]
-BOS_TOKEN = "<|reserved_0|>"
-
-# ---------------------------------------------------------------------------
-# Data download
-# ---------------------------------------------------------------------------
-
-def download_single_shard(index):
-    """Download one parquet shard with retries. Returns True on success."""
-    filename = f"shard_{index:05d}.parquet"
-    filepath = os.path.join(DATA_DIR, filename)
-    if os.path.exists(filepath):
-        return True
-
-    url = f"{BASE_URL}/{filename}"
-    max_attempts = 5
-    for attempt in range(1, max_attempts + 1):
-        try:
-            response = requests.get(url, stream=True, timeout=30)
-            response.raise_for_status()
-            temp_path = filepath + ".tmp"
-            with open(temp_path, "wb") as f:
-                for chunk in response.iter_content(chunk_size=1024 * 1024):
-                    if chunk:
-                        f.write(chunk)
-            os.rename(temp_path, filepath)
-            print(f"  Downloaded {filename}")
-            return True
-        except (requests.RequestException, IOError) as e:
-            print(f"  Attempt {attempt}/{max_attempts} failed for {filename}: {e}")
-            for path in [filepath + ".tmp", filepath]:
-                if os.path.exists(path):
-                    try:
-                        os.remove(path)
-                    except OSError:
-                        pass
-            if attempt < max_attempts:
-                time.sleep(2 ** attempt)
-    return False
-
-
-def download_data(num_shards, download_workers=8):
-    """Download training shards + pinned validation shard."""
-    os.makedirs(DATA_DIR, exist_ok=True)
-    num_train = min(num_shards, MAX_SHARD)
-    ids = list(range(num_train))
-    if VAL_SHARD not in ids:
-        ids.append(VAL_SHARD)
-
-    # Count what's already downloaded
-    existing = sum(1 for i in ids if os.path.exists(os.path.join(DATA_DIR, f"shard_{i:05d}.parquet")))
-    if existing == len(ids):
-        print(f"Data: all {len(ids)} shards already downloaded at {DATA_DIR}")
-        return
-
-    needed = len(ids) - existing
-    print(f"Data: downloading {needed} shards ({existing} already exist)...")
-
-    workers = max(1, min(download_workers, needed))
-    with Pool(processes=workers) as pool:
-        results = pool.map(download_single_shard, ids)
-
-    ok = sum(1 for r in results if r)
-    print(f"Data: {ok}/{len(ids)} shards ready at {DATA_DIR}")
-
-# ---------------------------------------------------------------------------
-# Tokenizer training
-# ---------------------------------------------------------------------------
-
-def list_parquet_files():
-    """Return sorted list of parquet file paths in the data directory."""
-    files = sorted(f for f in os.listdir(DATA_DIR) if f.endswith(".parquet") and not f.endswith(".tmp"))
-    return [os.path.join(DATA_DIR, f) for f in files]
-
-
-def text_iterator(max_chars=1_000_000_000, doc_cap=10_000):
-    """Yield documents from training split (all shards except pinned val shard)."""
-    parquet_paths = [p for p in list_parquet_files() if not p.endswith(VAL_FILENAME)]
-    nchars = 0
-    for filepath in parquet_paths:
-        pf = pq.ParquetFile(filepath)
-        for rg_idx in range(pf.num_row_groups):
-            rg = pf.read_row_group(rg_idx)
-            for text in rg.column("text").to_pylist():
-                doc = text[:doc_cap] if len(text) > doc_cap else text
-                nchars += len(doc)
-                yield doc
-                if nchars >= max_chars:
-                    return
-
-
-def train_tokenizer():
-    """Train BPE tokenizer using rustbpe, save as tiktoken pickle."""
-    tokenizer_pkl = os.path.join(TOKENIZER_DIR, "tokenizer.pkl")
-    token_bytes_path = os.path.join(TOKENIZER_DIR, "token_bytes.pt")
-
-    if os.path.exists(tokenizer_pkl) and os.path.exists(token_bytes_path):
-        print(f"Tokenizer: already trained at {TOKENIZER_DIR}")
-        return
-
-    os.makedirs(TOKENIZER_DIR, exist_ok=True)
-
-    parquet_files = list_parquet_files()
-    if len(parquet_files) < 2:
-        print("Tokenizer: need at least 2 data shards (1 train + 1 val). Download more data first.")
-        sys.exit(1)
-
-    # --- Train with rustbpe ---
-    print("Tokenizer: training BPE tokenizer...")
-    t0 = time.time()
-
-    tokenizer = rustbpe.Tokenizer()
-    vocab_size_no_special = VOCAB_SIZE - len(SPECIAL_TOKENS)
-    tokenizer.train_from_iterator(text_iterator(), vocab_size_no_special, pattern=SPLIT_PATTERN)
-
-    # Build tiktoken encoding from trained merges
-    pattern = tokenizer.get_pattern()
-    mergeable_ranks = {bytes(k): v for k, v in tokenizer.get_mergeable_ranks()}
-    tokens_offset = len(mergeable_ranks)
-    special_tokens = {name: tokens_offset + i for i, name in enumerate(SPECIAL_TOKENS)}
-    enc = tiktoken.Encoding(
-        name="rustbpe",
-        pat_str=pattern,
-        mergeable_ranks=mergeable_ranks,
-        special_tokens=special_tokens,
+def _read_sat_bounds(root: Path, flight_id: str) -> tuple[float, float, float, float]:
+    """Returns (lat_min, lon_min, lat_max, lon_max) from the VisLoc coordinates CSV."""
+    df = pd.read_csv(root / "satellite_coordinates_range.csv")
+    row = df[df["mapname"].isin([f"satellite{flight_id}.tif", f"{flight_id}.tif"])].iloc[0]
+    return (
+        float(row["RB_lat_map"]),  # lat_min  (RB = right-bottom corner)
+        float(row["LT_lon_map"]),  # lon_min  (LT = left-top corner)
+        float(row["LT_lat_map"]),  # lat_max
+        float(row["RB_lon_map"]),  # lon_max
     )
 
-    # Save tokenizer
-    with open(tokenizer_pkl, "wb") as f:
-        pickle.dump(enc, f)
 
-    t1 = time.time()
-    print(f"Tokenizer: trained in {t1 - t0:.1f}s, saved to {tokenizer_pkl}")
+class UAVDataset(Dataset):
+    """VisLoc UAV drone images. Used as the query set — never for training."""
 
-    # --- Build token_bytes lookup for BPB evaluation ---
-    print("Tokenizer: building token_bytes lookup...")
-    special_set = set(SPECIAL_TOKENS)
-    token_bytes_list = []
-    for token_id in range(enc.n_vocab):
-        token_str = enc.decode([token_id])
-        if token_str in special_set:
-            token_bytes_list.append(0)
+    def __init__(self, root: Path, flight_id: str, transform=None):
+        self.drone_dir = root / flight_id / "drone"
+        self.transform = transform
+        df = pd.read_csv(root / flight_id / f"{flight_id}.csv")
+        self.records = df[["filename", "lat", "lon"]].reset_index(drop=True)
+
+    def __len__(self) -> int:
+        return len(self.records)
+
+    def __getitem__(self, idx: int):
+        row = self.records.iloc[idx]
+        img = Image.open(self.drone_dir / row["filename"]).convert("RGB")
+        if self.transform is not None:
+            img = self.transform(img)
+        return img, float(row["lat"]), float(row["lon"])
+
+
+class SatChunkDataset(Dataset):
+    """Fixed, evenly-tiled satellite chunks. The retrieval gallery."""
+
+    def __init__(
+        self,
+        root: Path,
+        flight_id: str,
+        chunk_pixels: int = CHUNK_PIXELS,
+        stride_pixels: int = CHUNK_STRIDE,
+        scale_factor: float = MAP_SCALE_FACTOR,
+        transform=None,
+    ):
+        self.chunk_pixels = chunk_pixels
+        self.scale_factor = scale_factor
+        self.transform = transform
+
+        sat_path = root / flight_id / f"satellite{flight_id}.tif"
+        tile_paths = sorted((root / flight_id).glob(f"satellite{flight_id}_*.tif"))
+
+        if sat_path.exists():
+            with rasterio.open(sat_path) as src:
+                h = int(src.height * scale_factor)
+                w = int(src.width * scale_factor)
+                data = src.read([1, 2, 3], out_shape=(3, h, w), resampling=Resampling.bilinear)
+        elif tile_paths:
+            srcs = [rasterio.open(p) for p in tile_paths]
+            native_res = srcs[0].res
+            target_res = (native_res[0] / scale_factor, native_res[1] / scale_factor)
+            merged, _ = rasterio_merge(srcs, res=target_res, indexes=[1, 2, 3], resampling=Resampling.bilinear)
+            for s in srcs:
+                s.close()
+            data = merged
+            h, w = data.shape[1], data.shape[2]
         else:
-            token_bytes_list.append(len(token_str.encode("utf-8")))
-    token_bytes_tensor = torch.tensor(token_bytes_list, dtype=torch.int32)
-    torch.save(token_bytes_tensor, token_bytes_path)
-    print(f"Tokenizer: saved token_bytes to {token_bytes_path}")
+            raise FileNotFoundError(f"No satellite TIF found for flight {flight_id}")
 
-    # Sanity check
-    test = "Hello world! Numbers: 123. Unicode: 你好"
-    encoded = enc.encode_ordinary(test)
-    decoded = enc.decode(encoded)
-    assert decoded == test, f"Tokenizer roundtrip failed: {test!r} -> {decoded!r}"
-    print(f"Tokenizer: sanity check passed (vocab_size={enc.n_vocab})")
+        self._img = np.transpose(data, (1, 2, 0))  # (H, W, 3) uint8
+        self._bounds = _read_sat_bounds(root, flight_id)  # bounds from CSV (authoritative)
+        lat_min, lon_min, lat_max, lon_max = self._bounds
 
-# ---------------------------------------------------------------------------
-# Runtime utilities (imported by train.py)
-# ---------------------------------------------------------------------------
+        self._chunks: list[tuple[int, int, float, float]] = []
+        self._bboxes: list[tuple[float, float, float, float]] = []
+        for y in range(0, h - chunk_pixels, stride_pixels):
+            for x in range(0, w - chunk_pixels, stride_pixels):
+                cx = x + chunk_pixels // 2
+                cy = y + chunk_pixels // 2
+                lat = lat_max - (cy / h) * (lat_max - lat_min)
+                lon = lon_min + (cx / w) * (lon_max - lon_min)
+                self._chunks.append((x, y, lat, lon))
+                self._bboxes.append((
+                    lat_max - ((y + chunk_pixels) / h) * (lat_max - lat_min),  # lat_min of chunk
+                    lon_min + (x / w) * (lon_max - lon_min),                   # lon_min of chunk
+                    lat_max - (y / h) * (lat_max - lat_min),                   # lat_max of chunk
+                    lon_min + ((x + chunk_pixels) / w) * (lon_max - lon_min),  # lon_max of chunk
+                ))
 
-class Tokenizer:
-    """Minimal tokenizer wrapper. Training is handled above."""
+    @property
+    def chunk_coords(self) -> list[tuple[float, float]]:
+        return [(lat, lon) for _, _, lat, lon in self._chunks]
 
-    def __init__(self, enc):
-        self.enc = enc
-        self.bos_token_id = enc.encode_single_token(BOS_TOKEN)
+    @property
+    def chunk_bboxes(self) -> list[tuple[float, float, float, float]]:
+        return self._bboxes
 
-    @classmethod
-    def from_directory(cls, tokenizer_dir=TOKENIZER_DIR):
-        with open(os.path.join(tokenizer_dir, "tokenizer.pkl"), "rb") as f:
-            enc = pickle.load(f)
-        return cls(enc)
+    def __len__(self) -> int:
+        return len(self._chunks)
 
-    def get_vocab_size(self):
-        return self.enc.n_vocab
+    def __getitem__(self, idx: int):
+        x, y, lat, lon = self._chunks[idx]
+        crop = self._img[y:y + self.chunk_pixels, x:x + self.chunk_pixels]
+        img = Image.fromarray(crop)
+        if self.transform is not None:
+            img = self.transform(img)
+        return img, lat, lon
 
-    def get_bos_token_id(self):
-        return self.bos_token_id
-
-    def encode(self, text, prepend=None, num_threads=8):
-        if prepend is not None:
-            prepend_id = prepend if isinstance(prepend, int) else self.enc.encode_single_token(prepend)
-        if isinstance(text, str):
-            ids = self.enc.encode_ordinary(text)
-            if prepend is not None:
-                ids.insert(0, prepend_id)
-        elif isinstance(text, list):
-            ids = self.enc.encode_ordinary_batch(text, num_threads=num_threads)
-            if prepend is not None:
-                for row in ids:
-                    row.insert(0, prepend_id)
-        else:
-            raise ValueError(f"Invalid input type: {type(text)}")
-        return ids
-
-    def decode(self, ids):
-        return self.enc.decode(ids)
-
-
-def get_token_bytes(device="cpu"):
-    path = os.path.join(TOKENIZER_DIR, "token_bytes.pt")
-    with open(path, "rb") as f:
-        return torch.load(f, map_location=device)
-
-
-def _document_batches(split, tokenizer_batch_size=128):
-    """Infinite iterator over document batches from parquet files."""
-    parquet_paths = list_parquet_files()
-    assert len(parquet_paths) > 0, "No parquet files found. Run prepare.py first."
-    val_path = os.path.join(DATA_DIR, VAL_FILENAME)
-    if split == "train":
-        parquet_paths = [p for p in parquet_paths if p != val_path]
-        assert len(parquet_paths) > 0, "No training shards found."
-    else:
-        parquet_paths = [val_path]
-    epoch = 1
-    while True:
-        for filepath in parquet_paths:
-            pf = pq.ParquetFile(filepath)
-            for rg_idx in range(pf.num_row_groups):
-                rg = pf.read_row_group(rg_idx)
-                batch = rg.column('text').to_pylist()
-                for i in range(0, len(batch), tokenizer_batch_size):
-                    yield batch[i:i+tokenizer_batch_size], epoch
-        epoch += 1
-
-
-def make_dataloader(tokenizer, B, T, split, buffer_size=1000):
-    """
-    BOS-aligned dataloader with best-fit packing.
-    Every row starts with BOS. Documents packed using best-fit to minimize cropping.
-    When no document fits remaining space, crops shortest doc to fill exactly.
-    100% utilization (no padding).
-    """
-    assert split in ["train", "val"]
-    row_capacity = T + 1
-    batches = _document_batches(split)
-    bos_token = tokenizer.get_bos_token_id()
-    doc_buffer = []
-    epoch = 1
-
-    def refill_buffer():
-        nonlocal epoch
-        doc_batch, epoch = next(batches)
-        token_lists = tokenizer.encode(doc_batch, prepend=bos_token)
-        doc_buffer.extend(token_lists)
-
-    # Pre-allocate buffers: [inputs (B*T) | targets (B*T)]
-    row_buffer = torch.empty((B, row_capacity), dtype=torch.long)
-    cpu_buffer = torch.empty(2 * B * T, dtype=torch.long, pin_memory=True)
-    gpu_buffer = torch.empty(2 * B * T, dtype=torch.long, device="cuda")
-    cpu_inputs = cpu_buffer[:B * T].view(B, T)
-    cpu_targets = cpu_buffer[B * T:].view(B, T)
-    inputs = gpu_buffer[:B * T].view(B, T)
-    targets = gpu_buffer[B * T:].view(B, T)
-
-    while True:
-        for row_idx in range(B):
-            pos = 0
-            while pos < row_capacity:
-                while len(doc_buffer) < buffer_size:
-                    refill_buffer()
-
-                remaining = row_capacity - pos
-
-                # Find largest doc that fits entirely
-                best_idx = -1
-                best_len = 0
-                for i, doc in enumerate(doc_buffer):
-                    doc_len = len(doc)
-                    if doc_len <= remaining and doc_len > best_len:
-                        best_idx = i
-                        best_len = doc_len
-
-                if best_idx >= 0:
-                    doc = doc_buffer.pop(best_idx)
-                    row_buffer[row_idx, pos:pos + len(doc)] = torch.tensor(doc, dtype=torch.long)
-                    pos += len(doc)
-                else:
-                    # No doc fits — crop shortest to fill remaining
-                    shortest_idx = min(range(len(doc_buffer)), key=lambda i: len(doc_buffer[i]))
-                    doc = doc_buffer.pop(shortest_idx)
-                    row_buffer[row_idx, pos:pos + remaining] = torch.tensor(doc[:remaining], dtype=torch.long)
-                    pos += remaining
-
-        cpu_inputs.copy_(row_buffer[:, :-1])
-        cpu_targets.copy_(row_buffer[:, 1:])
-        gpu_buffer.copy_(cpu_buffer, non_blocking=True)
-        yield inputs, targets, epoch
 
 # ---------------------------------------------------------------------------
 # Evaluation (DO NOT CHANGE — this is the fixed metric)
 # ---------------------------------------------------------------------------
 
-@torch.no_grad()
-def evaluate_bpb(model, tokenizer, batch_size):
+def _flat_earth_dist_m(lat1: float, lon1: float, lats: np.ndarray, lons: np.ndarray) -> np.ndarray:
+    """Approximate flat-earth distance in metres from one point to an array of points."""
+    dlat = (lats - lat1) * 111_111
+    dlon = (lons - lon1) * 111_111 * np.cos(np.radians(lat1))
+    return np.sqrt(dlat ** 2 + dlon ** 2)
+
+
+def build_ground_truth(
+    uav_coords: np.ndarray,
+    chunk_bboxes: list[tuple[float, float, float, float]],
+) -> list[list[int]]:
+    """For each UAV query, return indices of satellite chunks that contain its GPS point.
+
+    Falls back to the nearest chunk if the GPS point falls outside all bboxes.
+    Multiple overlapping chunks are sorted by distance to the GPS point.
     """
-    Bits per byte (BPB): vocab size-independent evaluation metric.
-    Sums per-token cross-entropy (in nats), sums target byte lengths,
-    then converts nats/byte to bits/byte. Special tokens (byte length 0)
-    are excluded from both sums.
-    Uses fixed MAX_SEQ_LEN so results are comparable across configs.
+    bboxes = np.array(chunk_bboxes)
+    lat_mins, lon_mins = bboxes[:, 0], bboxes[:, 1]
+    lat_maxs, lon_maxs = bboxes[:, 2], bboxes[:, 3]
+    center_lats = (lat_mins + lat_maxs) / 2
+    center_lons = (lon_mins + lon_maxs) / 2
+    ground_truth = []
+    for lat, lon in uav_coords:
+        mask = (lat_mins <= lat) & (lat <= lat_maxs) & (lon_mins <= lon) & (lon <= lon_maxs)
+        indices = np.where(mask)[0]
+        if len(indices) == 0:
+            dists = _flat_earth_dist_m(lat, lon, center_lats, center_lons)
+            indices = np.array([np.argmin(dists)])
+        else:
+            dists = _flat_earth_dist_m(lat, lon, center_lats[indices], center_lons[indices])
+            indices = indices[np.argsort(dists)]
+        ground_truth.append(indices.tolist())
+    return ground_truth
+
+
+def recall_at_k(preds: np.ndarray, ground_truth: list[list[int]], k: int) -> float:
+    """Fraction of queries where any ground-truth chunk appears in the top-k predictions."""
+    hits = sum(any(p in gt for p in preds[i, :k]) for i, gt in enumerate(ground_truth))
+    return hits / len(ground_truth)
+
+
+def evaluate_r1(
+    uav_embs: np.ndarray,
+    sat_embs: np.ndarray,
+    uav_coords: np.ndarray,
+    chunk_bboxes: list[tuple[float, float, float, float]],
+) -> dict:
     """
-    token_bytes = get_token_bytes(device="cuda")
-    val_loader = make_dataloader(tokenizer, batch_size, MAX_SEQ_LEN, "val")
-    steps = EVAL_TOKENS // (batch_size * MAX_SEQ_LEN)
-    total_nats = 0.0
-    total_bytes = 0
-    for _ in range(steps):
-        x, y, _ = next(val_loader)
-        loss_flat = model(x, y, reduction='none').view(-1)
-        y_flat = y.view(-1)
-        nbytes = token_bytes[y_flat]
-        mask = nbytes > 0
-        total_nats += (loss_flat * mask).sum().item()
-        total_bytes += nbytes.sum().item()
-    return total_nats / (math.log(2) * total_bytes)
+    Compute Recall@1/5/10 for UAV-to-satellite retrieval.
+
+    L2-normalises both embedding sets, computes cosine similarity, ranks the
+    satellite gallery for each UAV query, and checks against GPS-based ground truth.
+
+    Args:
+        uav_embs:    (N_uav, D) float32 array of UAV query embeddings
+        sat_embs:    (N_sat, D) float32 array of satellite gallery embeddings
+        uav_coords:  (N_uav, 2) array of (lat, lon) for each UAV image
+        chunk_bboxes: list of (lat_min, lon_min, lat_max, lon_max) per gallery chunk
+
+    Returns:
+        dict with keys "R@1", "R@5", "R@10"
+    """
+    uav_n = uav_embs.astype(np.float32)
+    sat_n = sat_embs.astype(np.float32)
+    uav_n /= np.linalg.norm(uav_n, axis=1, keepdims=True) + 1e-8
+    sat_n /= np.linalg.norm(sat_n, axis=1, keepdims=True) + 1e-8
+    sim = uav_n @ sat_n.T          # (N_uav, N_sat) cosine similarity
+    preds = np.argsort(-sim, axis=1)  # descending rank
+    gt = build_ground_truth(uav_coords, chunk_bboxes)
+    return {
+        "R@1":  recall_at_k(preds, gt, 1),
+        "R@5":  recall_at_k(preds, gt, 5),
+        "R@10": recall_at_k(preds, gt, 10),
+    }
+
 
 # ---------------------------------------------------------------------------
-# Main
+# Sanity check
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Prepare data and tokenizer for autoresearch")
-    parser.add_argument("--num-shards", type=int, default=10, help="Number of training shards to download (-1 = all). Val shard is always pinned.")
-    parser.add_argument("--download-workers", type=int, default=8, help="Number of parallel download workers")
-    args = parser.parse_args()
-
-    num_shards = MAX_SHARD if args.num_shards == -1 else args.num_shards
-
-    print(f"Cache directory: {CACHE_DIR}")
+    print(f"VISLOC_ROOT : {VISLOC_ROOT}")
+    print(f"HF_HOME     : {HF_HOME}")
+    print(f"FLIGHT_ID   : {FLIGHT_ID}")
+    print(f"TIME_BUDGET : {TIME_BUDGET}s")
     print()
 
-    # Step 1: Download data
-    download_data(num_shards, download_workers=args.download_workers)
-    print()
+    print("Loading UAV dataset...")
+    uav_ds = UAVDataset(VISLOC_ROOT, FLIGHT_ID)
+    print(f"  UAV images   : {len(uav_ds)}")
 
-    # Step 2: Train tokenizer
-    train_tokenizer()
+    print("Loading satellite dataset...")
+    sat_ds = SatChunkDataset(VISLOC_ROOT, FLIGHT_ID)
+    print(f"  Sat chunks   : {len(sat_ds)}")
+
+    sd21_path = Path(HF_HOME) / "hub" / "models--sd2-community--stable-diffusion-2-1"
     print()
-    print("Done! Ready to train.")
+    print(f"SD21 cached  : {sd21_path.exists()}")
+
+    print()
+    print("Setup OK — ready to run experiments.")

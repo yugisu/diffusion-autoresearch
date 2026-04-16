@@ -1,114 +1,137 @@
-# autoresearch
+# diffusion-autoresearch
 
-This is an experiment to have the LLM do its own research.
+Autonomous research into UAV-to-satellite visual geo-localization using Stable Diffusion v2.1 internal representations.
+
+## Context
+
+**Task**: Given a UAV (drone) image, retrieve the matching satellite map tile — zero-shot, using features extracted from a frozen SD v2.1 UNet.
+
+**Dataset**: VisLoc flight_03 (Taizhou, China). 768 UAV queries, 2860 satellite gallery chunks at 512×512 px.
+
+**Metric**: **Recall@1 (R@1)** — the fraction of queries where the correct satellite chunk ranks first. Higher is better.
+
+**Target**: R@1 ≥ 0.10. Current best from naive SD21 baseline: ~0.004. Best from prior manual experiments: ~0.026 (DiffusionSat, down_blocks, ts≈840/999).
+
+**Prior experiments to read before starting**:
+- `/root/diffusion-vpr/results/1-baseline-comparison.csv` — cross-model comparison (DINOv3, DINOv2, RemoteCLIP, DiffusionSat, SD21, etc.)
+- `/root/diffusion-vpr/results/2-evaluate-timesteps.csv` — timestep and layer sweep for diffusion features
+
+Read both CSVs at the start of setup to absorb what has already been tried.
 
 ## Setup
 
-To set up a new experiment, work with the user to:
-
-1. **Agree on a run tag**: propose a tag based on today's date (e.g. `mar5`). The branch `autoresearch/<tag>` must not already exist — this is a fresh run.
-2. **Create the branch**: `git checkout -b autoresearch/<tag>` from current master.
-3. **Read the in-scope files**: The repo is small. Read these files for full context:
-   - `README.md` — repository context.
-   - `prepare.py` — fixed constants, data prep, tokenizer, dataloader, evaluation. Do not modify.
-   - `train.py` — the file you modify. Model architecture, optimizer, training loop.
-4. **Verify data exists**: Check that `~/.cache/autoresearch/` contains data shards and a tokenizer. If not, tell the human to run `uv run prepare.py`.
-5. **Initialize results.tsv**: Create `results.tsv` with just the header row. The baseline will be recorded after the first run.
-6. **Confirm and go**: Confirm setup looks good.
-
-Once you get confirmation, kick off the experimentation.
+1. **Agree on a run tag**: propose a tag based on today's date (e.g. `apr16`). The branch `autoresearch/<tag>` must not already exist.
+2. **Create the branch**: `git checkout -b autoresearch/<tag>` from main.
+3. **Read the in-scope files** — the repo is small, read all of them:
+   - `prepare.py` — fixed constants, dataset loading, and the evaluation function. Do not modify.
+   - `train.py` — the file you modify. Feature extraction pipeline and optional lightweight training.
+4. **Read prior results**: read both CSV files listed above.
+5. **Verify setup**: Run `uv run prepare.py` — it should print dataset sizes (768 UAV, 2860 sat) and confirm SD21 is cached.
+6. **Initialize results.tsv**: Create with just the header row. The baseline will be recorded after the first run.
+7. **Confirm and go**.
 
 ## Experimentation
 
-Each experiment runs on a single GPU. The training script runs for a **fixed time budget of 5 minutes** (wall clock training time, excluding startup/compilation). You launch it simply as: `uv run train.py`.
+Each experiment runs on a single GPU. The time budget per experiment is **12 minutes wall-clock** (TIME_BUDGET = 720s, excluding Python startup and eval).
 
-**What you CAN do:**
-- Modify `train.py` — this is the only file you edit. Everything is fair game: model architecture, optimizer, hyperparameters, training loop, batch size, model size, etc.
+**What you CAN do** (modify `train.py` freely):
+- Change which UNet layers to hook (down_blocks, mid_block, up_blocks — any combination)
+- Change the DDPM timestep (0–999); prior sweep suggests 800–950 for down_blocks
+- Change the aggregation method (GeM pool, average pool, spatial descriptors, PCA, etc.)
+- Change the text prompt or remove text conditioning entirely (null text)
+- Change the image resolution fed into the UNet (currently IMG_SIZE=256)
+- Add PCA whitening or other post-processing to decorrelate features
+- Add a **lightweight trainable component** (e.g. linear projection, small MLP) trained on GPS-matched UAV–satellite pairs from the same flight. The UAV GPS coordinates and satellite chunk bboxes are available through the dataset classes in prepare.py.
+- Combine features from multiple stages/timesteps
+- Use the VAE encoder output directly (skip the UNet entirely)
+- Try DDIM inversion instead of forward noising
+- Anything else that fits in the time budget
 
-**What you CANNOT do:**
-- Modify `prepare.py`. It is read-only. It contains the fixed evaluation, data loading, tokenizer, and training constants (time budget, sequence length, etc).
-- Install new packages or add dependencies. You can only use what's already in `pyproject.toml`.
-- Modify the evaluation harness. The `evaluate_bpb` function in `prepare.py` is the ground truth metric.
+**What you CANNOT do**:
+- Modify `prepare.py`. It contains the fixed evaluation and dataset split.
+- Install new packages or add dependencies.
+- Use external models (DINOv3, CLIP, etc.) — the point is to leverage SD v2.1 representations.
 
-**The goal is simple: get the lowest val_bpb.** Since the time budget is fixed, you don't need to worry about training time — it's always 5 minutes. Everything is fair game: change the architecture, the optimizer, the hyperparameters, the batch size, the model size. The only constraint is that the code runs without crashing and finishes within the time budget.
+**Key insight from prior work**: The main challenge is the domain gap between oblique UAV imagery (3976×2652 px, variable altitude ~400–600m) and nadir satellite tiles. Pure frozen SD features score near-random (R@1≈0.004). The 25× improvement gap to reach R@1=0.10 likely requires either (a) better feature selection, (b) post-processing to remove domain-invariant noise, or (c) a lightweight trained adapter.
 
-**VRAM** is a soft constraint. Some increase is acceptable for meaningful val_bpb gains, but it should not blow up dramatically.
-
-**Simplicity criterion**: All else being equal, simpler is better. A small improvement that adds ugly complexity is not worth it. Conversely, removing something and getting equal or better results is a great outcome — that's a simplification win. When evaluating whether to keep a change, weigh the complexity cost against the improvement magnitude. A 0.001 val_bpb improvement that adds 20 lines of hacky code? Probably not worth it. A 0.001 val_bpb improvement from deleting code? Definitely keep. An improvement of ~0 but much simpler code? Keep.
-
-**The first run**: Your very first run should always be to establish the baseline, so you will run the training script as is.
+**Ideas to explore** (not exhaustive — be creative):
+- Mid-block features (the UNet bottleneck): most compressed, highest-level semantics
+- Cross-attention activations (attn2 within transformer_blocks) vs. self-attention (attn1)
+- PCA whitening: subtract mean, divide by first N principal components (removes illumination/style)
+- Linear probe: train a small cross-domain projector on GPS-paired samples
+- Null text: set prompt_embeds to the empty string encoding for purely visual features
+- Up-block features at high timestep (prior data shows up_blocks are slightly worse than down_blocks overall, but they operate at higher resolution)
+- Combination of down_blocks spatial features (low channel, high resolution) and mid_block (high channel, low resolution)
 
 ## Output format
 
-Once the script finishes it prints a summary like this:
-
+When the script finishes it prints:
 ```
 ---
-val_bpb:          0.997900
-training_seconds: 300.1
-total_seconds:    325.9
-peak_vram_mb:     45060.2
-mfu_percent:      39.80
-total_tokens_M:   499.6
-num_steps:        953
-num_params_M:     50.3
-depth:            8
+R@1:       0.004000
+R@5:       0.015625
+R@10:      0.029948
+elapsed_s: 174.8
+emb_dim:   4480
 ```
 
-Note that the script is configured to always stop after 5 minutes, so depending on the computing platform of this computer the numbers might look different. You can extract the key metric from the log file:
-
+Extract the key metric:
 ```
-grep "^val_bpb:" run.log
+grep "^R@1:" run.log
+```
+
+If the grep is empty, the run crashed. Read the stack trace:
+```
+tail -n 50 run.log
 ```
 
 ## Logging results
 
-When an experiment is done, log it to `results.tsv` (tab-separated, NOT comma-separated — commas break in descriptions).
+Log to `results.tsv` (tab-separated — commas break inside descriptions). Do not commit this file.
 
-The TSV has a header row and 5 columns:
-
+Header and columns:
 ```
-commit	val_bpb	memory_gb	status	description
+commit	R@1	R@5	elapsed_s	status	description
 ```
 
-1. git commit hash (short, 7 chars)
-2. val_bpb achieved (e.g. 1.234567) — use 0.000000 for crashes
-3. peak memory in GB, round to .1f (e.g. 12.3 — divide peak_vram_mb by 1024) — use 0.0 for crashes
-4. status: `keep`, `discard`, or `crash`
-5. short text description of what this experiment tried
+1. `commit` — short git hash (7 chars)
+2. `R@1` — Recall@1 (e.g. 0.026042) — use 0.000000 for crashes
+3. `R@5` — Recall@5
+4. `elapsed_s` — total wall-clock seconds
+5. `status` — `keep`, `discard`, or `crash`
+6. `description` — short description of what this experiment tried
 
 Example:
-
 ```
-commit	val_bpb	memory_gb	status	description
-a1b2c3d	0.997900	44.0	keep	baseline
-b2c3d4e	0.993200	44.2	keep	increase LR to 0.04
-c3d4e5f	1.005000	44.0	discard	switch to GeLU activation
-d4e5f6g	0.000000	0.0	crash	double model width (OOM)
+commit	R@1	R@5	elapsed_s	status	description
+a1b2c3d	0.003906	0.015625	180.2	keep	baseline: down_blocks.attn1-2 ts=880 GeM
+b2c3d4e	0.012500	0.041667	210.5	keep	added mid_block hook + null text
+c3d4e5f	0.009375	0.031250	195.0	discard	PCA 128d (worse)
+d4e5f6g	0.000000	0.000000	0.0	crash	linear probe OOM
 ```
 
 ## The experiment loop
 
-The experiment runs on a dedicated branch (e.g. `autoresearch/mar5` or `autoresearch/mar5-gpu0`).
+The experiment runs on a dedicated branch (e.g. `autoresearch/apr16`).
+
+**First run**: always run the baseline first (train.py as written) to establish the reference point.
 
 LOOP FOREVER:
 
-1. Look at the git state: the current branch/commit we're on
-2. Tune `train.py` with an experimental idea by directly hacking the code.
-3. git commit
-4. Run the experiment: `uv run train.py > run.log 2>&1` (redirect everything — do NOT use tee or let output flood your context)
-5. Read out the results: `grep "^val_bpb:\|^peak_vram_mb:" run.log`
-6. If the grep output is empty, the run crashed. Run `tail -n 50 run.log` to read the Python stack trace and attempt a fix. If you can't get things to work after more than a few attempts, give up.
-7. Record the results in the tsv (NOTE: do not commit the results.tsv file, leave it untracked by git)
-8. If val_bpb improved (lower), you "advance" the branch, keeping the git commit
-9. If val_bpb is equal or worse, you git reset back to where you started
+1. Review git state and results.tsv to understand where you are.
+2. Form a hypothesis based on what has and hasn't worked. Consult the prior CSV files to avoid re-running known dead-ends.
+3. Edit `train.py` with one focused experimental change.
+4. `git commit` the change.
+5. `git push origin HEAD` — push immediately so results are visible upstream.
+6. `uv run train.py > run.log 2>&1`
+7. Extract metrics: `grep "^R@1:\|^R@5:\|^elapsed_s:" run.log`
+8. If grep is empty → crash. Read `tail -n 50 run.log`, fix if trivial, otherwise log as crash and discard.
+9. Log to `results.tsv`.
+10. If R@1 **improved** (strictly higher than current best): keep the commit, stay on it.
+11. If R@1 is equal or worse: `git revert HEAD --no-edit` then `git push origin HEAD` — revert rather than reset so upstream history stays clean.
 
-The idea is that you are a completely autonomous researcher trying things out. If they work, keep. If they don't, discard. And you're advancing the branch so that you can iterate. If you feel like you're getting stuck in some way, you can rewind but you should probably do this very very sparingly (if ever).
+**Timeout**: If a run exceeds 14 minutes total (720s TIME_BUDGET + ~2 min overhead), kill it and treat as crash.
 
-**Timeout**: Each experiment should take ~5 minutes total (+ a few seconds for startup and eval overhead). If a run exceeds 10 minutes, kill it and treat it as a failure (discard and revert).
+**NEVER STOP**: Once the loop begins, do NOT pause to ask the human whether to continue. The human may be asleep. Run until manually interrupted.
 
-**Crashes**: If a run crashes (OOM, or a bug, or etc.), use your judgment: If it's something dumb and easy to fix (e.g. a typo, a missing import), fix it and re-run. If the idea itself is fundamentally broken, just skip it, log "crash" as the status in the tsv, and move on.
-
-**NEVER STOP**: Once the experiment loop has begun (after the initial setup), do NOT pause to ask the human if you should continue. Do NOT ask "should I keep going?" or "is this a good stopping point?". The human might be asleep, or gone from a computer and expects you to continue working *indefinitely* until you are manually stopped. You are autonomous. If you run out of ideas, think harder — read papers referenced in the code, re-read the in-scope files for new angles, try combining previous near-misses, try more radical architectural changes. The loop runs until the human interrupts you, period.
-
-As an example use case, a user might leave you running while they sleep. If each experiment takes you ~5 minutes then you can run approx 12/hour, for a total of about 100 over the duration of the average human sleep. The user then wakes up to experimental results, all completed by you while they slept!
+If you run out of obvious ideas: re-read the prior CSVs, look for near-misses in your own results.tsv, try combinations of things that individually helped a little, or try more radical changes (different aggregation, architectural changes to the hook points, trained adapter).

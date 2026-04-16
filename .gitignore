@@ -21,3 +21,9 @@ dev/
 
 # Results file
 results.tsv
+
+# Experiment artifacts
+run.log
+cache/
+
+.env

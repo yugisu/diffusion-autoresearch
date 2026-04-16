@@ -1,27 +1,32 @@
 [project]
-name = "autoresearch"
+name = "diffusion-autoresearch"
 version = "0.1.0"
-description = "Autonomous pretraining research swarm"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "kernels>=0.11.7",
-    "matplotlib>=3.10.8",
-    "numpy>=2.2.6",
+    "torch>=2.2.0",
+    "torchvision",
+    "numpy>=1.26.3,<2",
+    "pillow>=12.1.1",
+    "rasterio>=1.4.4",
     "pandas>=2.3.3",
-    "pyarrow>=21.0.0",
-    "requests>=2.32.0",
-    "rustbpe>=0.1.0",
-    "tiktoken>=0.11.0",
-    "torch==2.9.1",
+    "tqdm>=4.67.3",
+    "matplotlib>=3.10.0",
+    "scikit-learn>=1.5.0",
+    "diffusers==0.17.0",
+    "transformers==4.40.0",
+    "huggingface-hub==0.19.3",
+    "accelerate==0.18.0",
+    "xformers==0.0.25.post1",
 ]
 
 [tool.uv.sources]
-torch = [
-    { index = "pytorch-cu128" },
-]
+torch = [{ index = "pytorch-cu121" }]
 
 [[tool.uv.index]]
-name = "pytorch-cu128"
-url = "https://download.pytorch.org/whl/cu128"
+name = "pytorch-cu121"
+url = "https://download.pytorch.org/whl/cu121"
 explicit = true
+
+[tool.uv.extra-build-dependencies]
+xformers = ["torch"]
