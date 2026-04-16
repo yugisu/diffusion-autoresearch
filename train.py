@@ -29,6 +29,7 @@ from prepare import (
     VISLOC_ROOT,
     SatChunkDataset,
     UAVDataset,
+    build_ground_truth,
     evaluate_r1,
 )
 
@@ -195,10 +196,14 @@ chunk_bboxes = sat_ds.chunk_bboxes
 print("Evaluating...")
 metrics = evaluate_r1(uav_embs, sat_embs, uav_coords, chunk_bboxes)
 
+gt = build_ground_truth(uav_coords, chunk_bboxes)
+avg_gt_chunks = sum(len(g) for g in gt) / len(gt)
+
 elapsed = time.time() - t_start
 print("---")
-print(f"R@1:       {metrics['R@1']:.6f}")
-print(f"R@5:       {metrics['R@5']:.6f}")
-print(f"R@10:      {metrics['R@10']:.6f}")
-print(f"elapsed_s: {elapsed:.1f}")
-print(f"emb_dim:   {uav_embs.shape[1]}")
+print(f"R@1:           {metrics['R@1']:.6f}")
+print(f"R@5:           {metrics['R@5']:.6f}")
+print(f"R@10:          {metrics['R@10']:.6f}")
+print(f"elapsed_s:     {elapsed:.1f}")
+print(f"emb_dim:       {uav_embs.shape[1]}")
+print(f"avg_gt_chunks: {avg_gt_chunks:.1f}")
