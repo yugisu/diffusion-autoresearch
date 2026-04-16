@@ -184,15 +184,26 @@ sat_ds = SatChunkDataset(
 )
 print(f"UAV queries: {len(uav_ds)} | Satellite gallery: {len(sat_ds)} chunks")
 
-uav_loader = DataLoader(uav_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True)
 sat_loader = DataLoader(sat_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True)
+
+
+def _uav_loader(hflip: bool = False) -> DataLoader:
+    ops = [transforms.Resize(IMG_SIZE), transforms.CenterCrop(IMG_SIZE)]
+    if hflip:
+        ops.append(transforms.RandomHorizontalFlip(p=1.0))
+    ops += [transforms.ToTensor(), transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])]
+    ds = UAVDataset(VISLOC_ROOT, FLIGHT_ID, transform=transforms.Compose(ops))
+    return DataLoader(ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True)
+
 
 # ---------------------------------------------------------------------------
 # Extract and evaluate
 # ---------------------------------------------------------------------------
 
-print("Extracting UAV embeddings...")
-uav_embs = extract_features(uav_loader)
+print("Extracting UAV embeddings (original)...")
+uav_embs = extract_features(_uav_loader(hflip=False))
+print("Extracting UAV embeddings (h-flip TTA)...")
+uav_embs += extract_features(_uav_loader(hflip=True))
 
 print("Extracting satellite embeddings...")
 sat_embs = extract_features(sat_loader)
