@@ -218,7 +218,7 @@ PCA_KEEP   = 1024 # total output dims after whitening (testing: 512 may be too a
 
 print(f"Applying PCA whitening: remove top {PCA_REMOVE}, keep {PCA_KEEP} dims...")
 all_embs = np.concatenate([uav_embs, sat_embs], axis=0)
-pca = PCA(n_components=PCA_REMOVE + PCA_KEEP, whiten=True)
+pca = PCA(n_components=PCA_REMOVE + PCA_KEEP, whiten=False)
 pca.fit(all_embs)
 # drop the first PCA_REMOVE components, keep the next PCA_KEEP
 uav_embs = pca.transform(uav_embs)[:, PCA_REMOVE:]
