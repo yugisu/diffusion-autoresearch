@@ -40,10 +40,10 @@ from transformers import CLIPTextModel, CLIPTokenizer
 
 # DiffusionSat checkpoint (SD v2.1 fine-tuned on satellite imagery)
 # Null text: purely visual features (same as best SD v2.1 config)
-BATCH_SIZE = 8      # reduced for 512×512 (4× more pixels than 256×256)
+BATCH_SIZE = 8
 IMG_SIZE = 512
-DDIM_STEPS = 5
-COLLECT = {2, 3, 4} # high-noise inversion steps (t≈401, 601, 801)
+DDIM_STEPS = 10
+COLLECT = {7, 8}    # prior sweep best for DiffusionSat: steps 7+8 out of 10 (t≈801, 881)
 PROMPT = ""
 DEVICE = "cuda"
 DTYPE = torch.float16
