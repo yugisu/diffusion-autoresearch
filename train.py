@@ -39,7 +39,10 @@ from transformers import CLIPTextModel, CLIPTokenizer
 BATCH_SIZE = 16
 IMG_SIZE   = 256
 DDIM_STEPS = 10
-COLLECT    = {7, 8}   # prior CSV best: steps 7+8 of 10 (t≈801, 881)
+# Original framework: save_timesteps=[8,7] means cur_t = num_steps-1-i,
+# so cur_t=8→i=1 (t=1), cur_t=7→i=2 (t=101). Our step_idx maps directly:
+# step_idx=0 → t=1, step_idx=1 → t=101.  LOW-noise, not high.
+COLLECT    = {0, 1}
 PROMPT     = "A satellite image"
 DEVICE     = "cuda"
 DTYPE      = torch.float16
@@ -91,15 +94,24 @@ def _make_hook(name: str):
         out = output[0] if isinstance(output, tuple) else output
         if hasattr(out, "sample"):
             out = out.sample
-        _features[name] = out.detach().float()
+        out = out.detach().float()
+        # attn1 outputs (B, H*W, C) — reshape to (B, C, H, W)
+        if out.dim() == 3:
+            B, L, C = out.shape
+            H = W = int(L ** 0.5)
+            out = out.reshape(B, H, W, C).permute(0, 3, 1, 2)
+        _features[name] = out
     return hook
 
 
+# Hook attn1 (self-attention) inside each Transformer2DModel in down_blocks.
+# Matches original: layer_idxs={'down_blocks': {'attn1': 'all'}}
 _hooks = []
 for _i, _block in enumerate(unet.down_blocks):
     if hasattr(_block, "attentions"):
-        for _j, _attn in enumerate(_block.attentions):
-            _hooks.append(_attn.register_forward_hook(_make_hook(f"d{_i}_{_j}")))
+        for _j, _transformer in enumerate(_block.attentions):
+            for _k, _tblock in enumerate(_transformer.transformer_blocks):
+                _hooks.append(_tblock.attn1.register_forward_hook(_make_hook(f"d{_i}_{_j}_{_k}")))
 
 # ---------------------------------------------------------------------------
 # Image transforms
@@ -116,11 +128,17 @@ _img_transform = transforms.Compose([
 # Feature extraction
 # ---------------------------------------------------------------------------
 
+def gem_pool(x: torch.Tensor, p: float = 3.0, eps: float = 1e-6) -> torch.Tensor:
+    """GeM pooling: (B, C, H, W) → (B, C). Matches original PoolConcatEmbedder."""
+    return F.avg_pool2d(x.clamp(min=eps).pow(p), x.shape[-2:]).pow(1.0 / p).flatten(1)
+
+
 @torch.inference_mode()
 def extract_features(dataloader: DataLoader) -> np.ndarray:
-    """DDIM inversion: collect features at high-noise steps."""
+    """DDIM inversion: collect attn1 features at low-noise steps (t=1, t=101)."""
     all_embs = []
     pe_cache = None
+    max_step = max(COLLECT)
     for batch in dataloader:
         imgs = batch[0].to(DEVICE, dtype=DTYPE)
         B = imgs.shape[0]
@@ -136,17 +154,17 @@ def extract_features(dataloader: DataLoader) -> np.ndarray:
             noise_pred = unet(z, t_tensor, encoder_hidden_states=pe_cache).sample
 
             if step_idx in COLLECT:
-                # avg pool each feature map, concat across blocks
-                vecs = [F.avg_pool2d(_features[k], _features[k].shape[-2:]).flatten(1)
-                        for k in sorted(_features)]
+                vecs = [gem_pool(_features[k]) for k in sorted(_features)]
                 collected.append(torch.cat(vecs, dim=1).float())
 
-            if step_idx < len(_inv_timesteps) - 1:
-                t_next  = _inv_timesteps[step_idx + 1]
-                a_t     = _alphas[t_curr].to(z.dtype)
-                a_next  = _alphas[t_next].to(z.dtype)
-                x0_pred = (z - (1 - a_t).sqrt() * noise_pred) / a_t.sqrt()
-                z       = a_next.sqrt() * x0_pred + (1 - a_next).sqrt() * noise_pred
+            if step_idx >= max_step:
+                break  # no need to invert further
+
+            t_next  = _inv_timesteps[step_idx + 1]
+            a_t     = _alphas[t_curr].to(z.dtype)
+            a_next  = _alphas[t_next].to(z.dtype)
+            x0_pred = (z - (1 - a_t).sqrt() * noise_pred) / a_t.sqrt()
+            z       = a_next.sqrt() * x0_pred + (1 - a_next).sqrt() * noise_pred
 
         emb = F.normalize(torch.cat(collected, dim=1), dim=1)
         all_embs.append(emb.cpu().numpy())
