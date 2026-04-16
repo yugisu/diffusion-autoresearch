@@ -9,7 +9,6 @@ The fixed evaluation is in prepare.py — do not modify it.
 """
 
 import gc
-import os
 import time
 
 import numpy as np
@@ -29,7 +28,6 @@ from prepare import (
     build_ground_truth,
     evaluate_r1,
 )
-from sklearn.decomposition import PCA
 from torch.utils.data import DataLoader
 from torchvision import transforms
 from transformers import CLIPTextModel, CLIPTokenizer
@@ -38,15 +36,13 @@ from transformers import CLIPTextModel, CLIPTokenizer
 # Config (edit these freely — this is the only file you modify)
 # ---------------------------------------------------------------------------
 
-# DiffusionSat checkpoint (SD v2.1 fine-tuned on satellite imagery)
-# Null text: purely visual features (same as best SD v2.1 config)
-BATCH_SIZE = 8
-IMG_SIZE = 512
+BATCH_SIZE = 16
+IMG_SIZE   = 256
 DDIM_STEPS = 10
-COLLECT = {7, 8}    # prior sweep best for DiffusionSat: steps 7+8 out of 10 (t≈801, 881)
-PROMPT = ""
-DEVICE = "cuda"
-DTYPE = torch.float16
+COLLECT    = {7, 8}   # prior CSV best: steps 7+8 of 10 (t≈801, 881)
+PROMPT     = "A satellite image"
+DEVICE     = "cuda"
+DTYPE      = torch.float16
 
 # ---------------------------------------------------------------------------
 # Startup
@@ -55,18 +51,15 @@ DTYPE = torch.float16
 t_start = time.time()
 gc.disable()
 
-# ---- Load DiffusionSat components ----
 print("Loading DiffusionSat SatUNet, VAE, CLIP text encoder...")
-unet = load_sat_unet(device=DEVICE, dtype=DTYPE)
-vae = AutoencoderKL.from_pretrained(DIFFUSIONSAT_CKPT, subfolder="vae", torch_dtype=DTYPE).to(DEVICE)
-tokenizer = CLIPTokenizer.from_pretrained(DIFFUSIONSAT_CKPT, subfolder="tokenizer")
+unet         = load_sat_unet(device=DEVICE, dtype=DTYPE)
+vae          = AutoencoderKL.from_pretrained(DIFFUSIONSAT_CKPT, subfolder="vae",          torch_dtype=DTYPE).to(DEVICE)
+tokenizer    = CLIPTokenizer.from_pretrained(DIFFUSIONSAT_CKPT, subfolder="tokenizer")
 text_encoder = CLIPTextModel.from_pretrained(DIFFUSIONSAT_CKPT, subfolder="text_encoder", torch_dtype=DTYPE).to(DEVICE)
-scheduler = DDIMScheduler.from_pretrained(DIFFUSIONSAT_CKPT, subfolder="scheduler")
+scheduler    = DDIMScheduler.from_pretrained(DIFFUSIONSAT_CKPT, subfolder="scheduler")
 scheduler.set_timesteps(DDIM_STEPS)
-# scheduler.timesteps (generation order): [801, 601, 401, 201, 1]
-# Inversion order (clean → noisy): [1, 201, 401, 601, 801]
 _inv_timesteps = list(reversed(scheduler.timesteps.tolist()))
-_alphas = scheduler.alphas_cumprod  # (1000,) on CPU
+_alphas        = scheduler.alphas_cumprod
 print(f"DDIM inversion timesteps (clean→noisy): {_inv_timesteps}")
 
 unet.eval().requires_grad_(False)
@@ -79,25 +72,15 @@ try:
 except Exception:
     pass
 
-# ---- Encode text prompt once ----
 text_inputs = tokenizer(
     PROMPT, return_tensors="pt", padding="max_length",
     max_length=tokenizer.model_max_length, truncation=True,
 )
 with torch.inference_mode():
-    prompt_embeds = text_encoder(text_inputs.input_ids.to(DEVICE))[0]  # (1, 77, 1024)
+    prompt_embeds = text_encoder(text_inputs.input_ids.to(DEVICE))[0]
 
 # ---------------------------------------------------------------------------
-# Feature hooks
-#
-# We hook every Transformer2DModel block in down_blocks (the cross-attention
-# down-path of the UNet). Each block outputs a spatial feature map (B, C, H, W).
-#
-# For IMG_SIZE=256, latent size is 32×32. Feature spatial dims per block:
-#   down_blocks[0].attentions[0,1] : (B, 320, 32, 32)
-#   down_blocks[1].attentions[0,1] : (B, 640, 16, 16)
-#   down_blocks[2].attentions[0,1] : (B, 1280, 8, 8)
-# Total after GeM pool + concat: 2*(320+640+1280) = 4480 dims.
+# Feature hooks — down_blocks attention outputs
 # ---------------------------------------------------------------------------
 
 _features: dict[str, torch.Tensor] = {}
@@ -119,30 +102,23 @@ for _i, _block in enumerate(unet.down_blocks):
             _hooks.append(_attn.register_forward_hook(_make_hook(f"d{_i}_{_j}")))
 
 # ---------------------------------------------------------------------------
-# Image transforms (UAV images: 3976×2652 px; sat chunks: CHUNK_PIXELS × CHUNK_PIXELS)
+# Image transforms
 # ---------------------------------------------------------------------------
 
 _img_transform = transforms.Compose([
-    transforms.Resize(IMG_SIZE),       # scale short edge to IMG_SIZE (preserve aspect)
-    transforms.CenterCrop(IMG_SIZE),   # square crop; UAV images are 3976×2652
+    transforms.Resize(IMG_SIZE),
+    transforms.CenterCrop(IMG_SIZE),
     transforms.ToTensor(),
-    transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),  # → [-1, 1] for VAE
+    transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
 ])
 
 # ---------------------------------------------------------------------------
-# Feature extraction helpers
+# Feature extraction
 # ---------------------------------------------------------------------------
-
-def pool_features(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-    """Avg + max pooling concat: (B, C, H, W) → (B, 2C). Complementary signals."""
-    avg = F.avg_pool2d(x, x.shape[-2:]).flatten(1)          # (B, C)
-    mx  = F.max_pool2d(x, x.shape[-2:]).flatten(1)           # (B, C)
-    return torch.cat([avg, mx], dim=1)                        # (B, 2C)
-
 
 @torch.inference_mode()
 def extract_features(dataloader: DataLoader) -> np.ndarray:
-    """DDIM inversion: map each image to noise, collect features at high-noise steps."""
+    """DDIM inversion: collect features at high-noise steps."""
     all_embs = []
     pe_cache = None
     for batch in dataloader:
@@ -160,18 +136,17 @@ def extract_features(dataloader: DataLoader) -> np.ndarray:
             noise_pred = unet(z, t_tensor, encoder_hidden_states=pe_cache).sample
 
             if step_idx in COLLECT:
-                vecs = [pool_features(_features[k]) for k in sorted(_features)]
+                # avg pool each feature map, concat across blocks
+                vecs = [F.avg_pool2d(_features[k], _features[k].shape[-2:]).flatten(1)
+                        for k in sorted(_features)]
                 collected.append(torch.cat(vecs, dim=1).float())
 
-            # DDIM inversion step: z_t → z_{t_next}
             if step_idx < len(_inv_timesteps) - 1:
-                t_next = _inv_timesteps[step_idx + 1]
-                a_t    = _alphas[t_curr].to(z.dtype)
-                a_next = _alphas[t_next].to(z.dtype)
-                # predicted x0 from current z and noise estimate
+                t_next  = _inv_timesteps[step_idx + 1]
+                a_t     = _alphas[t_curr].to(z.dtype)
+                a_next  = _alphas[t_next].to(z.dtype)
                 x0_pred = (z - (1 - a_t).sqrt() * noise_pred) / a_t.sqrt()
-                # inversion step: move z to t_next noise level
-                z = a_next.sqrt() * x0_pred + (1 - a_next).sqrt() * noise_pred
+                z       = a_next.sqrt() * x0_pred + (1 - a_next).sqrt() * noise_pred
 
         emb = F.normalize(torch.cat(collected, dim=1), dim=1)
         all_embs.append(emb.cpu().numpy())
@@ -194,57 +169,21 @@ print(f"UAV queries: {len(uav_ds)} | Satellite gallery: {len(sat_ds)} chunks")
 uav_loader = DataLoader(uav_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True)
 sat_loader = DataLoader(sat_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True)
 
-# UAV TTA loaders
-def _uav_loader(hflip: bool = False, scale: int = IMG_SIZE) -> DataLoader:
-    """Create a UAV DataLoader with optional h-flip and zoom-out scale."""
-    ops = [transforms.Resize(scale), transforms.CenterCrop(scale)]
-    if scale != IMG_SIZE:
-        ops.append(transforms.Resize(IMG_SIZE))  # downsample to 512 after wider crop
-    if hflip:
-        ops.append(transforms.RandomHorizontalFlip(p=1.0))
-    ops += [transforms.ToTensor(), transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])]
-    ds = UAVDataset(VISLOC_ROOT, FLIGHT_ID, transform=transforms.Compose(ops))
-    return DataLoader(ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True)
-
 # ---------------------------------------------------------------------------
-# Extract embeddings (2 UAV passes: original + h-flip TTA)
+# Extract and evaluate
 # ---------------------------------------------------------------------------
 
-print("Extracting UAV embeddings (original)...")
+print("Extracting UAV embeddings...")
 uav_embs = extract_features(uav_loader)
-print("Extracting UAV embeddings (h-flip)...")
-uav_embs += extract_features(_uav_loader(hflip=True))
-# Sum of two L2-normalised vectors; evaluate_r1 re-normalises
 
 print("Extracting satellite embeddings...")
 sat_embs = extract_features(sat_loader)
 
-# Geo-metadata for evaluation
 uav_coords = np.array([
     (float(uav_ds.records.iloc[i]["lat"]), float(uav_ds.records.iloc[i]["lon"]))
     for i in range(len(uav_ds))
 ])
 chunk_bboxes = sat_ds.chunk_bboxes
-
-# ---------------------------------------------------------------------------
-# PCA whitening — fit on combined UAV+sat, remove first N dominant components
-# (first components capture sensor/quality domain differences, not location)
-# ---------------------------------------------------------------------------
-
-PCA_REMOVE = 16   # number of leading PCA components to discard
-PCA_KEEP   = 1024 # total output dims after whitening (testing: 512 may be too aggressive)
-
-print(f"Applying PCA whitening: remove top {PCA_REMOVE}, keep {PCA_KEEP} dims...")
-all_embs = np.concatenate([uav_embs, sat_embs], axis=0)
-pca = PCA(n_components=PCA_REMOVE + PCA_KEEP, whiten=False)
-pca.fit(all_embs)
-# drop the first PCA_REMOVE components, keep the next PCA_KEEP
-uav_embs = pca.transform(uav_embs)[:, PCA_REMOVE:]
-sat_embs = pca.transform(sat_embs)[:, PCA_REMOVE:]
-
-# ---------------------------------------------------------------------------
-# Evaluate
-# ---------------------------------------------------------------------------
 
 print("Evaluating...")
 metrics = evaluate_r1(uav_embs, sat_embs, uav_coords, chunk_bboxes)
