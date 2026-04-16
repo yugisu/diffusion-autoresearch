@@ -195,7 +195,7 @@ chunk_bboxes = sat_ds.chunk_bboxes
 # (first components capture sensor/quality domain differences, not location)
 # ---------------------------------------------------------------------------
 
-PCA_REMOVE = 64   # number of leading PCA components to discard
+PCA_REMOVE = 16   # number of leading PCA components to discard
 PCA_KEEP   = 512  # total output dims after whitening
 
 print(f"Applying PCA whitening: remove top {PCA_REMOVE}, keep {PCA_KEEP} dims...")
