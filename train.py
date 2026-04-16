@@ -43,7 +43,7 @@ DDIM_STEPS = 10
 # Original framework: save_timesteps=[8,7] means cur_t = num_steps-1-i,
 # so cur_t=8→i=1 (t=1), cur_t=7→i=2 (t=101). Our step_idx maps directly:
 # step_idx=0 → t=1, step_idx=1 → t=101.  LOW-noise, not high.
-COLLECT    = {0, 1}
+COLLECT    = {0, 1, 2}   # t=1, t=101, t=201 — add third low-noise step
 PROMPT     = "A satellite image"
 DEVICE     = "cuda"
 DTYPE      = torch.float16
