@@ -58,11 +58,15 @@ Each experiment runs on a single GPU. The time budget per experiment is **12 min
 - Use supervised training of any kind (no GPS-paired positive/negative training, no contrastive loss).
 - Use external vision models. Allowed feature sources are: **SD v2.1 UNet activations** and **SD v2.1 VAE encoder output**. The CLIP text encoder is allowed only for producing text conditioning — its visual features are off-limits.
 
-**Strategy**: Start with fast, coarse, exploratory sweeps. Changes can be large and non-minimal. The goal is to cover the search space quickly in early experiments, then drill into what shows promise. Suggested early priorities:
-1. **Validate timestep for SD21**: run a quick sweep over a handful of timesteps (e.g. 200, 400, 600, 800, 950) with the current baseline to find SD21's own optimum — don't assume the DiffusionSat sweep transfers.
-2. **Try null text conditioning**: remove the CLIP prompt entirely (pass the unconditioned embedding or zero-embed) to get purely visual UNet features.
-3. **PCA whitening**: fit PCA on the concatenated UAV+satellite embeddings, drop the first 1–3 components (likely capture illumination/style, not location), re-evaluate. This is a 5-line change and may give a free boost.
-4. After finding a good frozen-feature config, try PCA whitening on top of it.
+**Strategy**: Two-phase exploration. Start with the **generation pass**, then transition to the **inversion pass** once the generation pass is well-optimised.
+
+**Generation pass** (current baseline): a single UNet forward pass on a noisy version of the image (`latent + noise at timestep T`). Fast — one forward pass per image. Explore this space first:
+1. **Validate timestep for SD21**: sweep a handful of timesteps (e.g. 200, 400, 600, 800, 950) to find SD21's optimum — don't assume the DiffusionSat sweep transfers.
+2. **Try null text conditioning**: pass the empty-string embedding instead of a prompt for purely visual UNet features.
+3. **Try different layer combinations**: not all down_blocks may carry location signal — try subsets.
+4. **PCA whitening**: fit PCA on the concatenated UAV+satellite embeddings, project out the first N components (sensor/quality variation), re-evaluate. Free boost, 5-line change.
+
+**Inversion pass** (transition once generation pass is optimised): DDIM inversion iteratively maps an image back to its noise representation, running multiple UNet passes and accumulating features along the trajectory. It captures richer multi-scale structure than a single forward pass but is slower (~10–50× per image depending on steps). Switch to this phase once you have a strong generation-pass baseline to beat. Use the same layer/timestep insights from Phase 1 as a starting point for which inversion steps to extract features from.
 
 **Key insight from prior work**: Both UAV and satellite images are nadir (top-down) — there is no perspective or viewpoint gap. UAV images are very high resolution and high quality. Satellite images have lower resolution and worse image quality (different sensor, compression). The domain gap is therefore primarily a **resolution and sensor quality gap**, not a viewpoint gap. This means rotation/perspective invariance is not the issue; the challenge is that the same scene looks sharp and detailed in UAV and blurry/degraded in satellite. UNet features at high noise timesteps (~t=800–950) encode coarse structure that partially survives this gap — but SD21 still scores near-random vs. ~0.026 for DiffusionSat which was fine-tuned on satellite data. Closing the gap likely means finding representations where coarse structural content (invariant to resolution) dominates fine texture (which differs across sensors).
 
