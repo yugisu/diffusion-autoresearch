@@ -16,11 +16,6 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from diffusers import AutoencoderKL, DDIMScheduler, UNet2DConditionModel
-from sklearn.decomposition import PCA
-from torch.utils.data import DataLoader
-from torchvision import transforms
-from transformers import CLIPTextModel, CLIPTokenizer
-
 from prepare import (
     CHUNK_PIXELS,
     CHUNK_STRIDE,
@@ -33,6 +28,10 @@ from prepare import (
     build_ground_truth,
     evaluate_r1,
 )
+from sklearn.decomposition import PCA
+from torch.utils.data import DataLoader
+from torchvision import transforms
+from transformers import CLIPTextModel, CLIPTokenizer
 
 # ---------------------------------------------------------------------------
 # Config (edit these freely — this is the only file you modify)
@@ -133,19 +132,10 @@ _img_transform = transforms.Compose([
 # ---------------------------------------------------------------------------
 
 def pool_features(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-    """Spatial pyramid: global avg+max + 2×2 grid avg+max → (B, 10C)."""
-    B, C, H, W = x.shape
-    parts = [
-        F.avg_pool2d(x, (H, W)).flatten(1),   # global avg
-        F.max_pool2d(x, (H, W)).flatten(1),   # global max
-    ]
-    h2, w2 = H // 2, W // 2
-    for i in range(2):
-        for j in range(2):
-            tile = x[:, :, i*h2:(i+1)*h2, j*w2:(j+1)*w2]
-            parts.append(F.avg_pool2d(tile, tile.shape[-2:]).flatten(1))
-            parts.append(F.max_pool2d(tile, tile.shape[-2:]).flatten(1))
-    return torch.cat(parts, dim=1)             # (B, 10C)
+    """Avg + max pooling concat: (B, C, H, W) → (B, 2C). Complementary signals."""
+    avg = F.avg_pool2d(x, x.shape[-2:]).flatten(1)          # (B, C)
+    mx  = F.max_pool2d(x, x.shape[-2:]).flatten(1)           # (B, C)
+    return torch.cat([avg, mx], dim=1)                        # (B, 2C)
 
 
 @torch.inference_mode()
@@ -157,7 +147,7 @@ def extract_features(dataloader: DataLoader) -> np.ndarray:
         imgs = batch[0].to(DEVICE, dtype=DTYPE)
         B = imgs.shape[0]
 
-        z = vae.encode(imgs).latent_dist.sample() * 0.18215
+        z = vae.encode(imgs).latent_dist.mode() * 0.18215
         if pe_cache is None or pe_cache.shape[0] != B:
             pe_cache = prompt_embeds.expand(B, -1, -1)
 
@@ -202,12 +192,27 @@ print(f"UAV queries: {len(uav_ds)} | Satellite gallery: {len(sat_ds)} chunks")
 uav_loader = DataLoader(uav_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True)
 sat_loader = DataLoader(sat_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True)
 
+# UAV TTA loaders
+def _uav_loader(hflip: bool = False, scale: int = IMG_SIZE) -> DataLoader:
+    """Create a UAV DataLoader with optional h-flip and zoom-out scale."""
+    ops = [transforms.Resize(scale), transforms.CenterCrop(scale)]
+    if scale != IMG_SIZE:
+        ops.append(transforms.Resize(IMG_SIZE))  # downsample to 512 after wider crop
+    if hflip:
+        ops.append(transforms.RandomHorizontalFlip(p=1.0))
+    ops += [transforms.ToTensor(), transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])]
+    ds = UAVDataset(VISLOC_ROOT, FLIGHT_ID, transform=transforms.Compose(ops))
+    return DataLoader(ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True)
+
 # ---------------------------------------------------------------------------
-# Extract embeddings
+# Extract embeddings (2 UAV passes: original + h-flip TTA)
 # ---------------------------------------------------------------------------
 
-print("Extracting UAV embeddings...")
+print("Extracting UAV embeddings (original)...")
 uav_embs = extract_features(uav_loader)
+print("Extracting UAV embeddings (h-flip)...")
+uav_embs += extract_features(_uav_loader(hflip=True))
+# Sum of two L2-normalised vectors; evaluate_r1 re-normalises
 
 print("Extracting satellite embeddings...")
 sat_embs = extract_features(sat_loader)
