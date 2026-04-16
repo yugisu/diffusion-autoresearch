@@ -62,8 +62,7 @@ Each experiment runs on a single GPU. The time budget per experiment is **12 min
 1. **Validate timestep for SD21**: run a quick sweep over a handful of timesteps (e.g. 200, 400, 600, 800, 950) with the current baseline to find SD21's own optimum — don't assume the DiffusionSat sweep transfers.
 2. **Try null text conditioning**: remove the CLIP prompt entirely (pass the unconditioned embedding or zero-embed) to get purely visual UNet features.
 3. **PCA whitening**: fit PCA on the concatenated UAV+satellite embeddings, drop the first 1–3 components (likely capture illumination/style, not location), re-evaluate. This is a 5-line change and may give a free boost.
-4. **Mid-block + down-block combination**: the bottleneck (mid_block) has the most global context; try combining it with down_blocks.
-5. After finding a good frozen-feature config, try PCA whitening on top of it.
+4. After finding a good frozen-feature config, try PCA whitening on top of it.
 
 **Key insight from prior work**: The main challenge is the domain gap between oblique UAV imagery (taken at ~400–600m altitude) and nadir satellite tiles. The UNet features at high noise timesteps (~t=800–950) encode coarse structure that partially survives this gap — but they still score near-random for SD21 vs. ~0.026 for DiffusionSat which was fine-tuned on satellite data. Closing the gap without training likely means finding the representations where location-correlated structure dominates illumination/viewpoint variation.
 
