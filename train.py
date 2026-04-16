@@ -15,6 +15,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from diffusers import AutoencoderKL, DDIMScheduler
+from sklearn.decomposition import PCA
 from diffusionsat import load_sat_unet, DIFFUSIONSAT_CKPT
 from prepare import (
     CHUNK_PIXELS,
@@ -213,6 +214,15 @@ uav_coords = np.array([
     for i in range(len(uav_ds))
 ])
 chunk_bboxes = sat_ds.chunk_bboxes
+
+PCA_REMOVE = 16
+PCA_KEEP   = 1024
+print(f"Applying PCA: remove top {PCA_REMOVE}, keep {PCA_KEEP} dims (whiten=False)...")
+_all = np.concatenate([uav_embs, sat_embs], axis=0)
+pca = PCA(n_components=PCA_REMOVE + PCA_KEEP, whiten=False)
+pca.fit(_all)
+uav_embs = pca.transform(uav_embs)[:, PCA_REMOVE:]
+sat_embs = pca.transform(sat_embs)[:, PCA_REMOVE:]
 
 print("Evaluating...")
 metrics = evaluate_r1(uav_embs, sat_embs, uav_coords, chunk_bboxes)
