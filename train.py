@@ -39,8 +39,8 @@ from prepare import (
 # ---------------------------------------------------------------------------
 
 SD21 = "sd2-community/stable-diffusion-2-1"
-BATCH_SIZE = 16     # images per UNet forward pass; reduce if OOM
-IMG_SIZE = 256      # resize images to IMG_SIZE × IMG_SIZE before VAE encode
+BATCH_SIZE = 8      # reduced for 512×512 (4× more pixels than 256×256)
+IMG_SIZE = 512      # higher res; Resize(512)+CenterCrop(512) for non-square UAV images
 DDIM_STEPS = 5      # DDIM inversion steps (5 passes per image, ~600s total)
 COLLECT = {2, 3, 4} # step indices to collect features from (high-noise end)
 PROMPT = ""         # null text: purely visual UNet features
@@ -122,7 +122,8 @@ for _i, _block in enumerate(unet.down_blocks):
 # ---------------------------------------------------------------------------
 
 _img_transform = transforms.Compose([
-    transforms.Resize((IMG_SIZE, IMG_SIZE)),
+    transforms.Resize(IMG_SIZE),       # scale short edge to IMG_SIZE (preserve aspect)
+    transforms.CenterCrop(IMG_SIZE),   # square crop; UAV images are 3976×2652
     transforms.ToTensor(),
     transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),  # → [-1, 1] for VAE
 ])
