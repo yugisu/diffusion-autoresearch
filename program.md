@@ -128,7 +128,7 @@ LOOP FOREVER:
 8. If grep is empty → crash. Read `tail -n 50 run.log`, fix if trivial, otherwise log as crash and discard.
 9. Log to `results.tsv`.
 10. If R@1 **improved** (strictly higher than current best): keep the commit, stay on it.
-11. If R@1 is equal or worse: `git revert HEAD --no-edit` then `git push origin HEAD` — revert rather than reset so upstream history stays clean.
+11. If R@1 is equal or worse: `git reset --hard HEAD~1 && git push --force origin HEAD` — wipe the bad commit locally and from the remote so the branch history only contains kept experiments. Force-push is safe here because autoresearch branches are never shared.
 
 **Timeout**: If a run exceeds 14 minutes total (720s TIME_BUDGET + ~2 min overhead), kill it and treat as crash.
 
