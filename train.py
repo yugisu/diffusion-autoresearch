@@ -15,7 +15,7 @@ import time
 import numpy as np
 import torch
 import torch.nn.functional as F
-from diffusers import AutoencoderKL, DDPMScheduler, UNet2DConditionModel
+from diffusers import AutoencoderKL, DDIMScheduler, UNet2DConditionModel
 from sklearn.decomposition import PCA
 from torch.utils.data import DataLoader
 from torchvision import transforms
@@ -41,8 +41,9 @@ from prepare import (
 SD21 = "sd2-community/stable-diffusion-2-1"
 BATCH_SIZE = 16     # images per UNet forward pass; reduce if OOM
 IMG_SIZE = 256      # resize images to IMG_SIZE × IMG_SIZE before VAE encode
-TIMESTEP = 880      # DDPM timestep 0–999. Prior sweep: ~800–950 is best for down_blocks.
-PROMPT = ""  # null text: purely visual UNet features, no text conditioning bias
+DDIM_STEPS = 5      # DDIM inversion steps (5 passes per image, ~600s total)
+COLLECT = {2, 3, 4} # step indices to collect features from (high-noise end)
+PROMPT = ""         # null text: purely visual UNet features
 DEVICE = "cuda"
 DTYPE = torch.float16
 
@@ -59,7 +60,13 @@ unet = UNet2DConditionModel.from_pretrained(SD21, subfolder="unet", torch_dtype=
 vae = AutoencoderKL.from_pretrained(SD21, subfolder="vae", torch_dtype=DTYPE).to(DEVICE)
 tokenizer = CLIPTokenizer.from_pretrained(SD21, subfolder="tokenizer")
 text_encoder = CLIPTextModel.from_pretrained(SD21, subfolder="text_encoder", torch_dtype=DTYPE).to(DEVICE)
-scheduler = DDPMScheduler.from_pretrained(SD21, subfolder="scheduler")
+scheduler = DDIMScheduler.from_pretrained(SD21, subfolder="scheduler")
+scheduler.set_timesteps(DDIM_STEPS)
+# scheduler.timesteps (generation order): [801, 601, 401, 201, 1]
+# Inversion order (clean → noisy): [1, 201, 401, 601, 801]
+_inv_timesteps = list(reversed(scheduler.timesteps.tolist()))
+_alphas = scheduler.alphas_cumprod  # (1000,) on CPU
+print(f"DDIM inversion timesteps (clean→noisy): {_inv_timesteps}")
 
 unet.eval().requires_grad_(False)
 vae.eval().requires_grad_(False)
@@ -131,28 +138,38 @@ def gem_pool(x: torch.Tensor, p: float = 3.0, eps: float = 1e-6) -> torch.Tensor
 
 @torch.inference_mode()
 def extract_features(dataloader: DataLoader) -> np.ndarray:
-    """Run the extraction pipeline over a dataloader, return (N, D) float32 array."""
+    """DDIM inversion: map each image to noise, collect features at high-noise steps."""
     all_embs = []
+    pe_cache = None
     for batch in dataloader:
         imgs = batch[0].to(DEVICE, dtype=DTYPE)
         B = imgs.shape[0]
 
-        # VAE encode: PIL image → latent
-        latents = vae.encode(imgs).latent_dist.sample() * 0.18215
+        z = vae.encode(imgs).latent_dist.sample() * 0.18215
+        if pe_cache is None or pe_cache.shape[0] != B:
+            pe_cache = prompt_embeds.expand(B, -1, -1)
 
-        # Add noise at the fixed timestep
-        t = torch.tensor([TIMESTEP] * B, device=DEVICE, dtype=torch.long)
-        noise = torch.randn_like(latents)
-        noisy = scheduler.add_noise(latents, noise, t)
+        collected = []
+        for step_idx, t_curr in enumerate(_inv_timesteps):
+            t_tensor = torch.tensor([t_curr] * B, device=DEVICE, dtype=torch.long)
+            _features.clear()
+            noise_pred = unet(z, t_tensor, encoder_hidden_states=pe_cache).sample
 
-        # UNet forward pass — we only care about the hooked intermediate features
-        _features.clear()
-        pe = prompt_embeds.expand(B, -1, -1)
-        unet(noisy, t, encoder_hidden_states=pe)
+            if step_idx in COLLECT:
+                vecs = [gem_pool(_features[k]) for k in sorted(_features)]
+                collected.append(torch.cat(vecs, dim=1).float())
 
-        # GeM-pool each spatial feature map, concatenate, L2-normalise
-        vecs = [gem_pool(_features[k]) for k in sorted(_features)]
-        emb = F.normalize(torch.cat(vecs, dim=1).float(), dim=1)
+            # DDIM inversion step: z_t → z_{t_next}
+            if step_idx < len(_inv_timesteps) - 1:
+                t_next = _inv_timesteps[step_idx + 1]
+                a_t    = _alphas[t_curr].to(z.dtype)
+                a_next = _alphas[t_next].to(z.dtype)
+                # predicted x0 from current z and noise estimate
+                x0_pred = (z - (1 - a_t).sqrt() * noise_pred) / a_t.sqrt()
+                # inversion step: move z to t_next noise level
+                z = a_next.sqrt() * x0_pred + (1 - a_next).sqrt() * noise_pred
+
+        emb = F.normalize(torch.cat(collected, dim=1), dim=1)
         all_embs.append(emb.cpu().numpy())
 
     return np.concatenate(all_embs, axis=0)
