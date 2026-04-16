@@ -41,7 +41,7 @@ SD21 = "sd2-community/stable-diffusion-2-1"
 BATCH_SIZE = 16     # images per UNet forward pass; reduce if OOM
 IMG_SIZE = 256      # resize images to IMG_SIZE × IMG_SIZE before VAE encode
 TIMESTEP = 880      # DDPM timestep 0–999. Prior sweep: ~800–950 is best for down_blocks.
-PROMPT = "a satellite image"
+PROMPT = ""  # null text: purely visual UNet features, no text conditioning bias
 DEVICE = "cuda"
 DTYPE = torch.float16
 
