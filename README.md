@@ -1,4 +1,12 @@
-# autoresearch
+# (diffusion) autoresearch
+
+## Experiment logs
+
+Results from autonomous research runs conducted with this framework:
+
+- **[SD v2.1 zero-shot UAV-to-satellite geo-localization](docs/stable-diffusion-zeroshot.md)** — 50 experiments using frozen SD v2.1 UNet features for cross-domain image retrieval. Best result: R@1 = 3.5% (branch `autoresearch/apr16b`).
+
+---
 
 ![teaser](progress.png)
 
@@ -79,12 +87,6 @@ Seeing as there seems to be a lot of interest in tinkering with autoresearch on 
 7. You'll want to lower `TOTAL_BATCH_SIZE` a lot, but keep it powers of 2, e.g. down to `2**14` (~16K) or so even, hard to tell.
 
 I think these would be the reasonable hyperparameters to play with. Ask your favorite coding agent for help and copy paste them this guide, as well as the full source code.
-
-## Experiment logs
-
-Results from autonomous research runs conducted with this framework:
-
-- **[SD v2.1 zero-shot UAV-to-satellite geo-localization](docs/stable-diffusion-zeroshot.md)** — 50 experiments using frozen SD v2.1 UNet features for cross-domain image retrieval. Best result: R@1 = 3.5% (branch `autoresearch/apr16b`).
 
 ## Notable forks
 
