@@ -1,7 +1,7 @@
 """
 VPR feature extraction script. This is the ONLY file you modify.
 
-Goal : maximize Recall@1 for UAV-to-satellite geo-localization using SD v2.1.
+Goal : maximize Recall@1 for UAV-to-satellite geo-localization using DiffusionSat.
 Budget: TIME_BUDGET seconds (12 min) wall-clock per experiment.
 Usage : uv run train.py > run.log 2>&1
 
@@ -15,7 +15,8 @@ import time
 import numpy as np
 import torch
 import torch.nn.functional as F
-from diffusers import AutoencoderKL, DDIMScheduler, UNet2DConditionModel
+from diffusers import AutoencoderKL, DDIMScheduler
+from diffusionsat import load_sat_unet, DIFFUSIONSAT_CKPT
 from prepare import (
     CHUNK_PIXELS,
     CHUNK_STRIDE,
@@ -37,12 +38,13 @@ from transformers import CLIPTextModel, CLIPTokenizer
 # Config (edit these freely — this is the only file you modify)
 # ---------------------------------------------------------------------------
 
-SD21 = "sd2-community/stable-diffusion-2-1"
+# DiffusionSat checkpoint (SD v2.1 fine-tuned on satellite imagery)
+# Null text: purely visual features (same as best SD v2.1 config)
 BATCH_SIZE = 8      # reduced for 512×512 (4× more pixels than 256×256)
-IMG_SIZE = 512      # higher res; Resize(512)+CenterCrop(512) for non-square UAV images
-DDIM_STEPS = 5      # DDIM inversion steps (5 passes per image, ~600s total)
-COLLECT = {2, 3, 4} # step indices to collect features from (high-noise end)
-PROMPT = ""         # null text: purely visual UNet features
+IMG_SIZE = 512
+DDIM_STEPS = 5
+COLLECT = {2, 3, 4} # high-noise inversion steps (t≈401, 601, 801)
+PROMPT = ""
 DEVICE = "cuda"
 DTYPE = torch.float16
 
@@ -53,13 +55,13 @@ DTYPE = torch.float16
 t_start = time.time()
 gc.disable()
 
-# ---- Load SD21 components ----
-print("Loading SD21 UNet, VAE, CLIP text encoder...")
-unet = UNet2DConditionModel.from_pretrained(SD21, subfolder="unet", torch_dtype=DTYPE).to(DEVICE)
-vae = AutoencoderKL.from_pretrained(SD21, subfolder="vae", torch_dtype=DTYPE).to(DEVICE)
-tokenizer = CLIPTokenizer.from_pretrained(SD21, subfolder="tokenizer")
-text_encoder = CLIPTextModel.from_pretrained(SD21, subfolder="text_encoder", torch_dtype=DTYPE).to(DEVICE)
-scheduler = DDIMScheduler.from_pretrained(SD21, subfolder="scheduler")
+# ---- Load DiffusionSat components ----
+print("Loading DiffusionSat SatUNet, VAE, CLIP text encoder...")
+unet = load_sat_unet(device=DEVICE, dtype=DTYPE)
+vae = AutoencoderKL.from_pretrained(DIFFUSIONSAT_CKPT, subfolder="vae", torch_dtype=DTYPE).to(DEVICE)
+tokenizer = CLIPTokenizer.from_pretrained(DIFFUSIONSAT_CKPT, subfolder="tokenizer")
+text_encoder = CLIPTextModel.from_pretrained(DIFFUSIONSAT_CKPT, subfolder="text_encoder", torch_dtype=DTYPE).to(DEVICE)
+scheduler = DDIMScheduler.from_pretrained(DIFFUSIONSAT_CKPT, subfolder="scheduler")
 scheduler.set_timesteps(DDIM_STEPS)
 # scheduler.timesteps (generation order): [801, 601, 401, 201, 1]
 # Inversion order (clean → noisy): [1, 201, 401, 601, 801]
