@@ -16,6 +16,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from diffusers import AutoencoderKL, DDPMScheduler, UNet2DConditionModel
+from sklearn.decomposition import PCA
 from torch.utils.data import DataLoader
 from torchvision import transforms
 from transformers import CLIPTextModel, CLIPTokenizer
@@ -188,6 +189,22 @@ uav_coords = np.array([
     for i in range(len(uav_ds))
 ])
 chunk_bboxes = sat_ds.chunk_bboxes
+
+# ---------------------------------------------------------------------------
+# PCA whitening — fit on combined UAV+sat, remove first N dominant components
+# (first components capture sensor/quality domain differences, not location)
+# ---------------------------------------------------------------------------
+
+PCA_REMOVE = 64   # number of leading PCA components to discard
+PCA_KEEP   = 512  # total output dims after whitening
+
+print(f"Applying PCA whitening: remove top {PCA_REMOVE}, keep {PCA_KEEP} dims...")
+all_embs = np.concatenate([uav_embs, sat_embs], axis=0)
+pca = PCA(n_components=PCA_REMOVE + PCA_KEEP, whiten=True)
+pca.fit(all_embs)
+# drop the first PCA_REMOVE components, keep the next PCA_KEEP
+uav_embs = pca.transform(uav_embs)[:, PCA_REMOVE:]
+sat_embs = pca.transform(sat_embs)[:, PCA_REMOVE:]
 
 # ---------------------------------------------------------------------------
 # Evaluate
