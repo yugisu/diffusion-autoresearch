@@ -1,0 +1,21 @@
+commit	R@1	R@5	elapsed_s	status	description
+b451093	0.011719	0.042969	516.3	discard	DiffSat: DDIM inv collect{7,8} high-noise — wrong timestep interpretation
+25d6f17	0.002604	0.013021	161.6	discard	DiffSat: img256 avg-pool prompt="A sat image" — still wrong timestep
+2207112	0.026042	0.044271	116.8	keep	DiffSat baseline: COLLECT={0,1} attn1 GeM img256 (matches prior CSV 0.023)
+c71a156	0.035156	0.069010	144.7	keep	h-flip TTA UAV embedding sum (NEW BEST)
+951b8c0	0.071615	0.131510	176.9	keep	PCA remove=16 keep=1024 whiten=False — massive boost (NEW BEST)
+9a74881	0.066406	0.154948	200.3	discard	avg+max pool (GeM better for R@1, though R@5 improved)
+7565eab	0.102865	0.188802	238.2	keep	IMG_SIZE=512 batch=8 — TARGET REACHED R@1≥0.10
+c8e56be	0.110677	0.170573	270.0	keep	COLLECT={0,1,2} add t=201 step (NEW BEST)
+1c6932f	0.098958	0.158854	259.9	discard	null prompt — hurts (DiffSat trained WITH "A satellite image")
+8553819	0.106771	0.167969	326.4	discard	PCA_KEEP=2048 (over-keeps noise dims, 1024 better)
+671e861	0.042969	0.096354	475.6	discard	Canny TTA both UAV+sat — DiffSat can't interpret edge maps, collapsed
+cb23caf	0.057292	0.136719	288.8	discard	mid_block attn1 — bottleneck amplifies fine sensor diffs at low noise, hurts
+c8e56be	0.065104	0.128906	262.4	discard	PCA_REMOVE=32 — over-strips signal (remove=16 is sweet spot)
+c8e56be	0.104167	0.194010	345.7	discard	4-rotation TTA (0/90/180/270) — 90° rotations distort DiffusionSat's satellite-oriented features
+c8e56be	0.052083	0.123698	890.5	discard	SPP 1×1+2×2+4×4 — no spatial correspondence in cross-view, 21× more dims, 890s over budget
+c8e56be	0.109375	0.183594	314.5	discard	up_blocks+down_blocks attn1 — decoder features redundant at low noise, no gain
+c8e56be	0.006510	0.016927	355.6	discard	img2img UAV→sat translation TRANSLATE_STEPS=5 — denoising hallucinates, destroys location signal
+c8e56be	0.109375	0.167969	271.6	discard	noise_pred+x0_pred as extra features — 4-channel latent too low-dim to add signal
+c8e56be	0.013021	0.041667	258.9	discard	per-modality z-score normalization — destroys joint PCA feature space alignment
+c8e56be	0.100260	0.148438	516.4	discard	IMG_SIZE=768 batch=4 — larger latent hurts (model trained at 256px, 512px is sweet spot)
