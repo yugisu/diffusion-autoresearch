@@ -71,8 +71,8 @@ SAT_SCALES = {
     "11": 0.25,
 }
 
-DEFAULT_BATCH_SIZE = 256
-DEFAULT_EVAL_BATCH_SIZE = 256
+DEFAULT_BATCH_SIZE = 128
+DEFAULT_EVAL_BATCH_SIZE = 128
 DEFAULT_NUM_WORKERS = 8
 
 
@@ -87,7 +87,7 @@ class Config:
     eval_batch_size: int = DEFAULT_EVAL_BATCH_SIZE
     num_workers: int = DEFAULT_NUM_WORKERS
 
-    lr: float = 2e-5
+    lr: float = 1e-5
     weight_decay: float = 1e-4
     temperature: float = 0.07
 
