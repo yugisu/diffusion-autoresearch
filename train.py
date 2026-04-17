@@ -160,9 +160,11 @@ class VisLocTrainPairDataset(Dataset):
         gt_candidates = self.gt_per_flight[flight][uav_idx]
         sat_idx = random.choice(gt_candidates)
 
-        uav_img, _, _ = self.uav_datasets[flight][uav_idx]
-        sat_img, _, _ = self.sat_datasets[flight][sat_idx]
-        return uav_img, sat_img
+        uav_img, uav_lat, uav_lon = self.uav_datasets[flight][uav_idx]
+        sat_img, sat_lat, sat_lon = self.sat_datasets[flight][sat_idx]
+        uav_coords = torch.tensor([uav_lat, uav_lon], dtype=torch.float32)
+        sat_coords = torch.tensor([sat_lat, sat_lon], dtype=torch.float32)
+        return uav_img, sat_img, uav_coords, sat_coords
 
 
 class VisLocDataModule(pl.LightningDataModule):
@@ -306,20 +308,40 @@ class DinoCrossViewRetriever(pl.LightningModule):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.encode(x)
 
-    def _contrastive_loss(self, q: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
+    def _multi_pos_infonce(self, q: torch.Tensor, k: torch.Tensor, pos_mask: torch.Tensor) -> torch.Tensor:
+        """Multi-positive InfoNCE: pos_mask[i,j]=1 means (query_i, key_j) is a positive pair."""
         scale = self.logit_scale.exp().clamp(max=100)
-        logits = (q @ k.t()) * scale
-        labels = torch.arange(q.size(0), device=q.device)
-        loss_qk = F.cross_entropy(logits, labels)
-        loss_kq = F.cross_entropy(logits.t(), labels)
-        return 0.5 * (loss_qk + loss_kq)
+        logits = (q @ k.t()) * scale  # (B, B)
+        log_probs = F.log_softmax(logits, dim=1)
+        n_pos = pos_mask.sum(dim=1).clamp(min=1)
+        loss_qk = -(log_probs * pos_mask).sum(dim=1) / n_pos
+        log_probs_t = F.log_softmax(logits.t(), dim=1)
+        n_pos_t = pos_mask.t().sum(dim=1).clamp(min=1)
+        loss_kq = -(log_probs_t * pos_mask.t()).sum(dim=1) / n_pos_t
+        return 0.5 * (loss_qk.mean() + loss_kq.mean())
+
+    def _build_pos_mask(self, uav_coords: torch.Tensor, sat_coords: torch.Tensor, threshold_m: float = 100.0) -> torch.Tensor:
+        """GPS-proximity positive mask: (B, B) float, 1 if UAV_i GPS is within threshold_m of sat_j center."""
+        uav_lat = uav_coords[:, 0].cpu().numpy()
+        uav_lon = uav_coords[:, 1].cpu().numpy()
+        sat_lat = sat_coords[:, 0].cpu().numpy()
+        sat_lon = sat_coords[:, 1].cpu().numpy()
+        dlat = (sat_lat[None, :] - uav_lat[:, None]) * 111111.0
+        mean_lat = np.radians((uav_lat[:, None] + sat_lat[None, :]) / 2.0)
+        dlon = (sat_lon[None, :] - uav_lon[:, None]) * 111111.0 * np.cos(mean_lat)
+        dist = np.sqrt(dlat ** 2 + dlon ** 2)
+        mask = torch.tensor(dist < threshold_m, dtype=torch.float32, device=uav_coords.device)
+        # Diagonal always positive
+        mask = (mask + torch.eye(len(uav_lat), device=mask.device)).clamp(max=1.0)
+        return mask
 
     def training_step(self, batch, batch_idx):
-        uav, sat = batch
+        uav, sat, uav_coords, sat_coords = batch
         q = self.encode(uav)
         k = self.encode(sat)
 
-        loss = self._contrastive_loss(q, k)
+        pos_mask = self._build_pos_mask(uav_coords, sat_coords)
+        loss = self._multi_pos_infonce(q, k, pos_mask)
         self.log("train/loss", loss, on_step=True, on_epoch=True, prog_bar=True, batch_size=uav.size(0))
         self.log("train/logit_scale", self.logit_scale.exp(), on_step=True, on_epoch=False, prog_bar=False)
         return loss
