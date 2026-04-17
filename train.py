@@ -91,7 +91,7 @@ class Config:
     weight_decay: float = 1e-4
     temperature: float = 0.07
 
-    max_epochs: int = 10
+    max_epochs: int = 20
     max_steps: int = -1
     precision: str = "16-mixed"
     seed: int = 42
@@ -274,6 +274,16 @@ class DinoCrossViewRetriever(pl.LightningModule):
         self.backbone = AutoModel.from_pretrained(cfg.model_name, trust_remote_code=True)
         hidden = self.backbone.config.hidden_size
 
+        # Freeze early blocks (0-7), train only last 4 blocks + norm
+        for param in self.backbone.parameters():
+            param.requires_grad = False
+        encoder_layers = self.backbone.encoder.layer
+        for block in encoder_layers[8:]:
+            for param in block.parameters():
+                param.requires_grad = True
+        for param in self.backbone.layernorm.parameters():
+            param.requires_grad = True
+
         self.proj = nn.Sequential(
             nn.Linear(hidden, hidden),
             nn.GELU(),
@@ -346,21 +356,28 @@ class DinoCrossViewRetriever(pl.LightningModule):
         self.log("val/R@5", float(metrics["R@5"]), prog_bar=False, sync_dist=False)
         self.log("val/R@10", float(metrics["R@10"]), prog_bar=False, sync_dist=False)
 
+        gap = 0.90 - float(metrics["R@1"])
         print(
             f"[VAL flight {VAL_FLIGHT}] R@1={metrics['R@1']:.4f} R@5={metrics['R@5']:.4f} R@10={metrics['R@10']:.4f} | gap_to_90={gap:.4f}"
         )
 
     def configure_optimizers(self):
-        optimizer = AdamW(self.parameters(), lr=self.cfg.lr, weight_decay=self.cfg.weight_decay)
+        backbone_params = [p for p in self.backbone.parameters() if p.requires_grad]
+        head_params = list(self.proj.parameters()) + [self.logit_scale]
+
+        param_groups = [
+            {"params": backbone_params, "lr": 5e-5},
+            {"params": head_params, "lr": 1e-4},
+        ]
+        optimizer = AdamW(param_groups, weight_decay=self.cfg.weight_decay)
 
         if self.trainer.max_steps is not None and self.trainer.max_steps > 0:
             t_max = self.trainer.max_steps
         else:
-            # fallback for epoch-based runs
             train_batches = max(len(self.trainer.datamodule.train_dataloader()), 1)
             t_max = self.trainer.max_epochs * train_batches
 
-        scheduler = CosineAnnealingLR(optimizer, T_max=t_max, eta_min=self.cfg.lr * 0.05)
+        scheduler = CosineAnnealingLR(optimizer, T_max=t_max, eta_min=5e-5 * 0.05)
         return {
             "optimizer": optimizer,
             "lr_scheduler": {
