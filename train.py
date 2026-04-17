@@ -188,8 +188,7 @@ class VisLocDataModule(pl.LightningDataModule):
 
         self.train_uav_transform = transforms.Compose(
             [
-                transforms.Resize(cfg.image_size),
-                transforms.CenterCrop((cfg.image_size, cfg.image_size)),
+                transforms.Resize((cfg.image_size, cfg.image_size)),
                 transforms.RandomHorizontalFlip(p=0.5),
                 transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.05),
                 transforms.ToTensor(),
@@ -208,8 +207,7 @@ class VisLocDataModule(pl.LightningDataModule):
         )
         self.eval_transform = transforms.Compose(
             [
-                transforms.Resize(cfg.image_size),
-                transforms.CenterCrop((cfg.image_size, cfg.image_size)),
+                transforms.Resize((cfg.image_size, cfg.image_size)),
                 transforms.ToTensor(),
                 transforms.Normalize(mean=mean, std=std),
             ]
