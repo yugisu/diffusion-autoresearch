@@ -27,7 +27,11 @@ run.log
 cache/
 
 .env
-wandb/
+
+# Run stuff.
+wandb
+checkpoints
 tea_debug.log
 autoresearch.jsonl
 autoresearch.md
+autoresearch.sh

@@ -37,7 +37,7 @@ Task details:
 - Train flights: `01, 02, 04, 05, 06, 08, 09, 10, 11`
 - Validation flight: `03`
 - Primary metric: `R@1` on flight 03, evaluated with fixed `evaluate_r1` in `prepare.py`
-- Goal: **R@1 >= 0.70**
+- Goal: **R@1 >= 0.90**
 
 Satellite scale priors (usable with SatChunkDataset, adjustable as per your experiments):
 

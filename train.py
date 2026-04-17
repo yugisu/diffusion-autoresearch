@@ -69,6 +69,10 @@ SAT_SCALES = {
     "11": 0.25,
 }
 
+DEFAULT_BATCH_SIZE = 384
+DEFAULT_EVAL_BATCH_SIZE = 384
+DEFAULT_NUM_WORKERS = 8
+
 
 @dataclass
 class Config:
@@ -77,15 +81,15 @@ class Config:
     image_size: int = 224
     embedding_dim: int = 512
 
-    batch_size: int = 32
-    eval_batch_size: int = 64
-    num_workers: int = 8
+    batch_size: int = DEFAULT_BATCH_SIZE
+    eval_batch_size: int = DEFAULT_EVAL_BATCH_SIZE
+    num_workers: int = DEFAULT_NUM_WORKERS
 
     lr: float = 2e-5
     weight_decay: float = 1e-4
     temperature: float = 0.07
 
-    max_epochs: int = 20
+    max_epochs: int = 10
     max_steps: int = -1
     precision: str = "16-mixed"
     seed: int = 42
@@ -236,8 +240,8 @@ class VisLocDataModule(pl.LightningDataModule):
             )
 
     def train_dataloader(self):
-        return DataLoader(
-            self.train_ds,
+        kwargs = dict(
+            dataset=self.train_ds,
             batch_size=self.cfg.batch_size,
             shuffle=True,
             num_workers=self.cfg.num_workers,
@@ -245,24 +249,23 @@ class VisLocDataModule(pl.LightningDataModule):
             persistent_workers=self.cfg.num_workers > 0,
             drop_last=True,
         )
+        if self.cfg.num_workers > 0:
+            kwargs["prefetch_factor"] = 4
+        return DataLoader(**kwargs)
 
     def val_dataloader(self):
-        uav_loader = DataLoader(
-            self.val_uav_ds,
+        common = dict(
             batch_size=self.cfg.eval_batch_size,
             shuffle=False,
             num_workers=self.cfg.num_workers,
             pin_memory=True,
             persistent_workers=self.cfg.num_workers > 0,
         )
-        sat_loader = DataLoader(
-            self.val_sat_ds,
-            batch_size=self.cfg.eval_batch_size,
-            shuffle=False,
-            num_workers=self.cfg.num_workers,
-            pin_memory=True,
-            persistent_workers=self.cfg.num_workers > 0,
-        )
+        if self.cfg.num_workers > 0:
+            common["prefetch_factor"] = 4
+
+        uav_loader = DataLoader(self.val_uav_ds, **common)
+        sat_loader = DataLoader(self.val_sat_ds, **common)
         return [uav_loader, sat_loader]
 
 
@@ -352,13 +355,13 @@ class DinoCrossViewRetriever(pl.LightningModule):
         self.log("val/R@5", float(metrics["R@5"]), prog_bar=False, sync_dist=False)
         self.log("val/R@10", float(metrics["R@10"]), prog_bar=False, sync_dist=False)
 
-        target = 0.70
+        target = 0.90
         gap = target - float(metrics["R@1"])
-        self.log("val/R@1_gap_to_70", gap, prog_bar=False, sync_dist=False)
+        self.log("val/R@1_gap_to_90", gap, prog_bar=False, sync_dist=False)
 
         print(
             f"[VAL flight {VAL_FLIGHT}] R@1={metrics['R@1']:.4f} "
-            f"R@5={metrics['R@5']:.4f} R@10={metrics['R@10']:.4f} | gap_to_70={gap:.4f}"
+            f"R@5={metrics['R@5']:.4f} R@10={metrics['R@10']:.4f} | gap_to_90={gap:.4f}"
         )
 
     def configure_optimizers(self):
@@ -390,9 +393,9 @@ def parse_args() -> Config:
     parser = argparse.ArgumentParser(description="Supervised DINOv3 fine-tuning for VisLoc retrieval")
 
     parser.add_argument("--visloc-root", type=str, default=str(VISLOC_ROOT))
-    parser.add_argument("--batch-size", type=int, default=32)
-    parser.add_argument("--eval-batch-size", type=int, default=64)
-    parser.add_argument("--num-workers", type=int, default=8)
+    parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
+    parser.add_argument("--eval-batch-size", type=int, default=DEFAULT_EVAL_BATCH_SIZE)
+    parser.add_argument("--num-workers", type=int, default=DEFAULT_NUM_WORKERS)
     parser.add_argument("--image-size", type=int, default=224)
     parser.add_argument("--embedding-dim", type=int, default=512)
 
@@ -400,7 +403,7 @@ def parse_args() -> Config:
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--temperature", type=float, default=0.07)
 
-    parser.add_argument("--max-epochs", type=int, default=20)
+    parser.add_argument("--max-epochs", type=int, default=10)
     parser.add_argument("--max-steps", type=int, default=-1)
     parser.add_argument("--precision", type=str, default="16-mixed")
     parser.add_argument("--seed", type=int, default=42)
@@ -446,6 +449,10 @@ def main():
     print(f"Val flight: {VAL_FLIGHT}")
     print(f"Satellite scales: {SAT_SCALES}")
     print(f"Data root: {cfg.visloc_root}")
+    print(
+        f"Train config: batch_size={cfg.batch_size}, eval_batch_size={cfg.eval_batch_size}, "
+        f"num_workers={cfg.num_workers}, max_epochs={cfg.max_epochs}"
+    )
     print("=" * 80)
 
     datamodule = VisLocDataModule(cfg)
@@ -458,6 +465,7 @@ def main():
     )
 
     ckpt_cb = ModelCheckpoint(
+        dirpath="checkpoints/supervised-dinov3",
         monitor="val/R@1",
         mode="max",
         save_top_k=1,
