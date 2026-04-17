@@ -21,6 +21,7 @@ import argparse
 import os
 import random
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, List
 
 import lightning.pytorch as pl
@@ -168,7 +169,7 @@ class VisLocDataModule(pl.LightningDataModule):
     def __init__(self, cfg: Config):
         super().__init__()
         self.cfg = cfg
-        self.root = cfg.visloc_root
+        self.root = Path(cfg.visloc_root)
 
         self.train_ds = None
         self.val_uav_ds = None

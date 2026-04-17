@@ -27,3 +27,6 @@ run.log
 cache/
 
 .env
+wandb/
+tea_debug.log
+autoresearch.jsonl

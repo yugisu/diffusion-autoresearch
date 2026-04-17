@@ -47,7 +47,7 @@ sat_scales = {"01": 0.25,"02": 0.25,"03": 0.25,"04": 0.25,"05": 0.4,"06": 0.6,"0
 
 Start point instruction:
 
-- Initial `max_epochs` should be **10**.
+- Initial `max_epochs` should be 20.
 - During the loop, agent can change `max_epochs` freely if experiments justify it.
 
 **What you CAN do:**
@@ -64,7 +64,7 @@ Start point instruction:
 
 **Simplicity criterion**: all else equal, simpler is better. Keep complexity proportional to gains.
 
-**The first run**: Your very first run should always establish baseline with current defaults (`max_epochs=10`).
+**The first run**: Your very first run should always establish baseline with current defaults (`max_epochs=20`).
 
 ## Output format
 
