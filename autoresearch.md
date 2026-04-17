@@ -35,4 +35,7 @@ Optimize `train.py` to maximize retrieval Recall@1 (R@1) for UAV-to-satellite ge
   - `Best val/R@1: ...`
 
 ## What's Been Tried
-- Baseline setup phase complete; no autoresearch experiments logged yet.
+- **Baseline (current defaults, batch 256, cosine schedule)**: R@1 **0.4349** (best so far), R@5 0.6549, R@10 0.7604.
+- **Removed light geometric augmentations** (`RandomHorizontalFlip`/`RandomRotation` removed): regressed to R@1 **0.4284** → discard. Augmentations appear helpful, keep them.
+- **User-directed dynamics test** (batch 128, LR 2e-5, 2-epoch warmup, no cosine, augmentations kept): strong regression (final R@1 **0.3841**, best ckpt ~0.4076) with longer runtime; discard.
+- Added harness-level parsing for training diagnostics (`train_samples_per_sec`, `train_samples_seen`) via `[TRAIN PROGRESS]` lines for future step-budget analysis.
