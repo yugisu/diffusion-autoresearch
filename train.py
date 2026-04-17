@@ -277,11 +277,10 @@ class DinoCrossViewRetriever(pl.LightningModule):
         # Freeze early blocks (0-7), train only last 4 blocks + norm
         for param in self.backbone.parameters():
             param.requires_grad = False
-        encoder_layers = self.backbone.encoder.layer
-        for block in encoder_layers[8:]:
+        for block in self.backbone.layer[8:]:
             for param in block.parameters():
                 param.requires_grad = True
-        for param in self.backbone.layernorm.parameters():
+        for param in self.backbone.norm.parameters():
             param.requires_grad = True
 
         self.proj = nn.Sequential(
