@@ -4,6 +4,11 @@ set -euo pipefail
 # Fast pre-check
 uv run python -m py_compile train.py
 
+# Dataset filename compatibility fix (observed typo in some dataset exports)
+if [[ -f /workspace/data/visloc/satellite_\ coordinates_range.csv && ! -f /workspace/data/visloc/satellite_coordinates_range.csv ]]; then
+  cp /workspace/data/visloc/satellite_\ coordinates_range.csv /workspace/data/visloc/satellite_coordinates_range.csv
+fi
+
 rm -f run.log
 start_ts=$(date +%s)
 
