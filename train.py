@@ -346,10 +346,6 @@ class DinoCrossViewRetriever(pl.LightningModule):
         self.log("val/R@5", float(metrics["R@5"]), prog_bar=False, sync_dist=False)
         self.log("val/R@10", float(metrics["R@10"]), prog_bar=False, sync_dist=False)
 
-        target = 0.90
-        gap = target - float(metrics["R@1"])
-        self.log("val/R@1_gap_to_90", gap, prog_bar=False, sync_dist=False)
-
         print(
             f"[VAL flight {VAL_FLIGHT}] R@1={metrics['R@1']:.4f} R@5={metrics['R@5']:.4f} R@10={metrics['R@10']:.4f} | gap_to_90={gap:.4f}"
         )

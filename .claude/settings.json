@@ -24,6 +24,8 @@
       "Read(~/SatDiFuser/**)",
       "Read(~/caevl/**)",
       "Read(~/dift/**)",
+      "Read(/workspace/**)",
+      "WebSearch(*)",
       "WebFetch(domain:arxiv.org)",
       "WebFetch(domain:www.mdpi.com)",
       "WebFetch(domain:www.researchgate.net)",

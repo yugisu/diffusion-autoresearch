@@ -23,7 +23,7 @@ from torch.utils.data import Dataset
 VISLOC_ROOT = Path("/workspace/data/visloc")
 HF_HOME = "/workspace/.hugging_face"
 FLIGHT_ID = "03"
-TIME_BUDGET = 720  # seconds (12 minutes wall-clock budget per experiment)
+TIME_BUDGET = 2700  # seconds (45 minutes wall-clock budget per experiment)
 
 # Satellite gallery config — fixed for fair comparison across runs.
 # These define the retrieval database: 2860 chunks at 512px with 128-px stride.

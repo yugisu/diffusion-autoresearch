@@ -21,7 +21,7 @@ Once you get confirmation, kick off experimentation.
 
 ## Experimentation
 
-Each experiment runs on a single GPU. The training script runs with a **fixed time budget of 20 minutes** per experiment (wall clock budget for a run).
+Each experiment runs on a single GPU. The training script runs with a **fixed time budget of 45 minutes** per experiment (wall clock budget for a run).
 
 Run command:
 
@@ -53,6 +53,7 @@ Start point instruction:
 **What you CAN do:**
 
 - Modify `train.py` only. Everything in `train.py` is fair game (head, losses, samplers, miners, augments, optimizer/scheduler, freezing, precision, scale tuning, etc.).
+- Perform significant architectural shifts to highlight different exploration pathways.
 
 **What you CANNOT do:**
 
@@ -63,8 +64,6 @@ Start point instruction:
 **The goal is simple: maximize val `R@1` on flight 03.**
 
 **Simplicity criterion**: all else equal, simpler is better. Keep complexity proportional to gains.
-
-**The first run**: Your very first run should always establish baseline with current defaults (`max_epochs=20`).
 
 ## Output format
 
@@ -109,6 +108,26 @@ d4e5f6g	0.000000	0.000000	0.000000	crash	OOM at batch_size=64
 
 Do not commit `results.tsv`.
 
+## Prior experiments findings & project knowledge
+
+Baseline version the start of the experiments provided following results: after 10 epochs at bs=128 R@1=0.4362 R@5=0.66 R@10=0.76. No need to re-run this experiment.
+
+VisLoc dataset description: UAV images feature high-quality images taken at nadir with a Mavic-like drone. Satellite imagery features a large satellite map that gets split into chunks. The goal of the resulting system is to implement geo-localization through retrieval of UAV to satellite images. While the domain gap between UAV and satellite imagery is significant, it seems like it mostly comes from camera specifics (UAV images are of better quality, colors are very different, UAV images include slight haze and have lower contrast), or image timings (satellite images might be out-of-date sometimes). Also, the training dataset features some bodies of water which might be irrelevant for training (or fine!).
+
+The experiments loop is conducted on a powerful machine that has an A100 GPU with 80GB of VRAM - keep that in mind and utilize the GPU accordingly.
+
+Also, there are some suggestions for future experiments (explore and exploit promising branches if you find any, regardless if they belong to this list or not!):
+- Multi-positive InfoNCE — Replace the arange labels loss with a masked multi-positive formulation so valid GT satellite chunks are not penalized as
+  negatives.
+- Stronger UAV and satellite augmentations — Add RandomPerspective + aggressive RandomResizedCrop to UAV; add 0/90/180/270° random rotation and
+stronger color jitter to satellite. Target the known domain gap (color, contrast, haze).
+- Differential LR + partial unfreezing — Freeze the first ~8 backbone blocks, unfreeze the last 4 with lr=5e-5, head at lr=1e-4. Prevents early
+feature degradation while letting the upper layers specialize.
+- Larger image size (336px or 448px) — Increase input resolution to retain more texture from the 512px satellite chunks. Leverage the A100's 80GB to
+keep batch size reasonable.
+- Hard negative mining via GPS proximity — During training, sample negatives that are geographically close to the UAV GPS position but fall outside
+the GT bbox, forcing finer spatial discrimination.
+
 ## The experiment loop
 
 The experiment runs on a dedicated branch (`autoresearch/supervised-dinov3`).
@@ -125,10 +144,10 @@ LOOP FOREVER:
 8. If `R@1` improved (higher), advance branch and keep commit.
 9. If `R@1` is equal/worse, reset to previous best commit.
 
-**Timeout**: Each experiment should take ~25 minutes total (+ a few seconds for startup and eval overhead). If a run exceeds 30 minutes, kill it and treat it as a failure (discard and revert).
+**Timeout**: Each experiment should take ~50 minutes total (+ a few seconds for startup and eval overhead). If a run exceeds 55 minutes, kill it, leave a timeout note in the results, and use the best validation metric as its result. While the model should be trained for longer under ideal circumstances, the goal of these experiments is to iterate on approach quickly.
 
 **Crashes**: If a run crashes (OOM, or a bug, or etc.), use your judgment: If it's something dumb and easy to fix (e.g. a typo, a missing import), fix it and re-run. If the idea itself is fundamentally broken, just skip it, log "crash" as the status in the tsv, and move on.
 
-**NEVER STOP**: Once the experiment loop has begun (after the initial setup), do NOT pause to ask the human if you should continue. Do NOT ask "should I keep going?" or "is this a good stopping point?". The human might be asleep, or gone from a computer and expects you to continue working _indefinitely_ until you are manually stopped. You are autonomous. If you run out of ideas, think harder — re-read the in-scope files for new angles, try combining previous near-misses, try more radical architectural changes. The loop runs until the human interrupts you, period.
+**NEVER STOP**: Once the experiment loop has begun (after the initial setup), do NOT pause to ask the human if you should continue. Do NOT ask "should I keep going?" or "is this a good stopping point?". The human might be asleep, or gone from a computer and expects you to continue working _indefinitely_ until you are manually stopped. You are autonomous. If you run out of ideas, think harder — read related papers on the topic (use arxiv and other sources), re-read the in-scope files for new angles, try combining previous near-misses, try more radical architectural changes. The loop runs until the human interrupts you, period.
 
-As an example use case, a user might leave you running while they sleep. If each experiment takes you ~30 minutes then you can run approx 2/hour, for a total of about 16 over the duration of the average human sleep. The user then wakes up to experimental results, all completed by you while they slept!
+As an example use case, a user might leave you running while they sleep. If each experiment takes you ~45 minutes then you can run approx 1/hour, for a total of about 10 over the duration of the average human sleep. The user then wakes up to experimental results, all completed by you while they slept!
