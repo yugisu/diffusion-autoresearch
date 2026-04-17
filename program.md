@@ -1,146 +1,134 @@
-# diffusion-autoresearch
+# autoresearch
 
-Autonomous research into UAV-to-satellite visual geo-localization using Stable Diffusion v2.1 internal representations.
-
-## Context
-
-**Task**: Given a UAV (drone) image, retrieve the matching satellite map tile using features from a frozen SD v2.1 UNet. No supervised training with labels is allowed — only test-time adaptation on unlabelled data.
-
-**Dataset**: VisLoc flight_03 (Taizhou, China). 768 UAV queries, 2860 satellite gallery chunks at 512×512 px.
-
-**Metric**: **Recall@1 (R@1)** — the fraction of queries where the correct satellite chunk ranks first. Higher is better.
-
-**Ground truth**: A satellite chunk is *correct* for a UAV image if the UAV's GPS point falls inside the chunk's bounding box. Because chunks overlap (stride=128 < size=512), each query typically has ~10–16 correct gallery chunks. The baseline output prints `avg_gt_chunks` to confirm this.
-
-**Target**: R@1 ≥ 0.10. Current best from naive SD21 baseline: ~0.004. Best from prior manual experiments: ~0.026 (DiffusionSat, down_blocks, ts≈840/999). **Stop and report when R@1 ≥ 0.10 is reached — do not push higher.**
-
-**Prior experiments to read before starting**:
-- `/root/diffusion-vpr/results/1-baseline-comparison.csv` — cross-model comparison (DINOv3, DINOv2, RemoteCLIP, DiffusionSat, SD21, etc.)
-- `/root/diffusion-vpr/results/2-evaluate-timesteps.csv` — timestep and layer sweep for diffusion features (**NOTE**: this sweep used DiffusionSat, not vanilla SD21 — the optimal timestep for SD21 may differ and should be validated early)
-
-Read both CSVs at the start of setup to absorb what has already been tried.
+This is an experiment to have the LLM do its own research.
 
 ## Setup
 
-1. **Agree on a run tag**: propose a tag based on today's date (e.g. `apr16`). The branch `autoresearch/<tag>` must not already exist.
-2. **Create the branch**: `git checkout -b autoresearch/<tag>` from main.
-3. **Read the in-scope files** — the repo is small, read all of them:
-   - `prepare.py` — fixed constants, dataset loading, and the evaluation function. Do not modify.
-   - `train.py` — the file you modify. Feature extraction pipeline and test-time adaptation.
-4. **Read prior results**: read both CSV files listed above.
-5. **Verify setup**: Run `uv run prepare.py` — it should print dataset sizes (768 UAV, 2860 sat) and confirm SD21 is cached.
-6. **Initialize results.tsv**: Create with just the header row. The baseline will be recorded after the first run.
-7. **Confirm and go**.
+To set up a new experiment, work with the user to:
+
+1. **Agree on a run tag**: propose a tag based on today's date (e.g. `apr17`). The branch `autoresearch/<tag>` must not already exist — this is a fresh run.
+2. **Create the branch**: `git checkout -b autoresearch/<tag>` from current main/master.
+   - For this run, use: **`autoresearch/supervised-dinov3`**.
+3. **Read the in-scope files**: The repo is small. Read these files for full context:
+   - `README.md` — repository context.
+   - `prepare.py` — fixed constants, dataset loading, and fixed evaluation. Do not modify.
+   - `train.py` — the file you modify. Model, optimizer, training loop.
+4. **Verify data exists**: Check that VisLoc data exists at `VISLOC_ROOT` (default from `prepare.py`). If missing, tell the human to run data preparation first.
+5. **Initialize results.tsv**: Create `results.tsv` with just the header row. The baseline will be recorded after the first run.
+6. **Confirm and go**: Confirm setup looks good.
+
+Once you get confirmation, kick off experimentation.
 
 ## Experimentation
 
-Each experiment runs on a single GPU. The time budget per experiment is **12 minutes wall-clock** (TIME_BUDGET = 720s, excluding Python startup).
+Each experiment runs on a single GPU. The training script runs with a **fixed time budget of 20 minutes** per experiment (wall clock budget for a run).
 
-**What you CAN do** (modify `train.py` freely):
-- Change which UNet layers to hook (down_blocks, mid_block, up_blocks — any combination)
-- Change the DDPM timestep (0–999); the baseline uses 880 but this is unvalidated for vanilla SD21
-- Change the aggregation method (GeM pool, average pool, spatial patch descriptors, etc.)
-- Change the text prompt or remove text conditioning entirely (null/empty text)
-- Change the image resolution fed into the UNet (currently IMG_SIZE=256)
-- Apply **test-time adaptation** — any unsupervised method fitted on the unlabelled eval set itself:
-  - PCA / PCA whitening (removes dominant style/illumination components)
-  - Dimensionality reduction
-  - Feature centering / standardisation
-  - Any other transform that uses no GPS labels
-- Combine features from multiple stages/timesteps
-- Use the VAE encoder output directly (skip the UNet entirely — the VAE is part of the SD21 pipeline)
-- Try DDIM inversion instead of forward noising
-- Anything else that fits in the time budget and uses no label supervision
+Run command:
 
-**What you CANNOT do**:
+```bash
+uv run train.py > run.log 2>&1
+```
+
+Task details:
+
+- Model: `facebook/dinov3-vitb16-pretrain-lvd1689m`
+- Framework: PyTorch Lightning
+- Logging: Weights & Biases (`autoresearch-supervised-dinov3`, auth via env/WANDB_API_KEY)
+- Train flights: `01, 02, 04, 05, 06, 08, 09, 10, 11`
+- Validation flight: `03`
+- Primary metric: `R@1` on flight 03, evaluated with fixed `evaluate_r1` in `prepare.py`
+- Goal: **R@1 >= 0.70**
+
+Satellite scale priors (usable with SatChunkDataset, adjustable as per your experiments):
+
+```python
+sat_scales = {"01": 0.25,"02": 0.25,"03": 0.25,"04": 0.25,"05": 0.4,"06": 0.6,"08": 0.35,"09": 0.25,"10": 0.5,"11": 0.25,}
+```
+
+Start point instruction:
+
+- Initial `max_epochs` should be **10**.
+- During the loop, agent can change `max_epochs` freely if experiments justify it.
+
+**What you CAN do:**
+
+- Modify `train.py` only. Everything in `train.py` is fair game (head, losses, samplers, miners, augments, optimizer/scheduler, freezing, precision, scale tuning, etc.).
+
+**What you CANNOT do:**
+
 - Modify `prepare.py`.
-- Install new packages or add dependencies.
-- Use supervised training of any kind (no GPS-paired positive/negative training, no contrastive loss).
-- Use external vision models. Allowed feature sources are: **SD v2.1 UNet activations** and **SD v2.1 VAE encoder output**. The CLIP text encoder is allowed only for producing text conditioning — its visual features are off-limits.
+- Modify the fixed evaluation logic in `prepare.py`.
+- Install new packages or add dependencies during the loop.
 
-**Strategy**: Two-phase exploration. Start with the **generation pass**, then transition to the **inversion pass** once the generation pass is well-optimised.
+**The goal is simple: maximize val `R@1` on flight 03.**
 
-**Generation pass** (current baseline): a single UNet forward pass on a noisy version of the image (`latent + noise at timestep T`). Fast — one forward pass per image. Explore this space first:
-1. **Validate timestep for SD21**: sweep a handful of timesteps (e.g. 200, 400, 600, 800, 950) to find SD21's optimum — don't assume the DiffusionSat sweep transfers.
-2. **Try null text conditioning**: pass the empty-string embedding instead of a prompt for purely visual UNet features.
-3. **Try different layer combinations**: not all down_blocks may carry location signal — try subsets.
-4. **PCA whitening**: fit PCA on the concatenated UAV+satellite embeddings, project out the first N components (sensor/quality variation), re-evaluate. Free boost, 5-line change.
+**Simplicity criterion**: all else equal, simpler is better. Keep complexity proportional to gains.
 
-**Inversion pass** (transition once generation pass is optimised): DDIM inversion iteratively maps an image back to its noise representation, running multiple UNet passes and accumulating features along the trajectory. It captures richer multi-scale structure than a single forward pass but is slower (~10–50× per image depending on steps). Switch to this phase once you have a strong generation-pass baseline to beat. Use the same layer/timestep insights from Phase 1 as a starting point for which inversion steps to extract features from.
-
-**Key insight from prior work**: Both UAV and satellite images are nadir (top-down) — there is no perspective or viewpoint gap. UAV images are very high resolution and high quality. Satellite images have lower resolution and worse image quality (different sensor, compression). The domain gap is therefore primarily a **resolution and sensor quality gap**, not a viewpoint gap. This means rotation/perspective invariance is not the issue; the challenge is that the same scene looks sharp and detailed in UAV and blurry/degraded in satellite. UNet features at high noise timesteps (~t=800–950) encode coarse structure that partially survives this gap — but SD21 still scores near-random vs. ~0.026 for DiffusionSat which was fine-tuned on satellite data. Closing the gap likely means finding representations where coarse structural content (invariant to resolution) dominates fine texture (which differs across sensors).
+**The first run**: Your very first run should always establish baseline with current defaults (`max_epochs=10`).
 
 ## Output format
 
-When the script finishes it prints:
-```
----
-R@1:           0.004000
-R@5:           0.015625
-R@10:          0.029948
-elapsed_s:     174.8
-emb_dim:       4480
-avg_gt_chunks: 12.4
+At run completion, extract key metrics from log:
+
+```bash
+grep "R@1\|R@5\|R@10\|Best checkpoint\|Best val/R@1" run.log
 ```
 
-Extract the key metrics:
-```
-grep "^R@[15]\|^elapsed_s" run.log
-```
+If grep is empty, run crashed. Read stack trace:
 
-If the grep is empty, the run crashed. Read the stack trace:
-```
+```bash
 tail -n 50 run.log
 ```
 
 ## Logging results
 
-Log to `results.tsv` (tab-separated — commas break inside descriptions). Do not commit this file.
+When an experiment is done, log it to `results.tsv` (tab-separated, NOT comma-separated — commas break in descriptions).
 
-Header and columns:
-```
-commit	R@1	R@5	elapsed_s	status	description
+The TSV has a header row and 6 columns:
+
+```tsv
+commit	R@1	R@5	R@10	status	description
 ```
 
-1. `commit` — short git hash (7 chars)
-2. `R@1` — Recall@1 (e.g. 0.026042) — use 0.000000 for crashes
-3. `R@5` — Recall@5
-4. `elapsed_s` — total wall-clock seconds
-5. `status` — `keep`, `discard`, or `crash`
-6. `description` — short description of what this experiment tried
+1. git commit hash (short, 7 chars)
+2. R@1 achieved (e.g. `0.412760`) — use `0.000000` for crashes
+3. R@5 achieved — use `0.000000` for crashes
+4. R@10 achieved — use `0.000000` for crashes
+5. status: `keep`, `discard`, or `crash`
+6. short text description of what this experiment tried
 
 Example:
+
+```tsv
+commit	R@1	R@5	R@10	status	description
+a1b2c3d	0.312500	0.654948	0.781250	keep	baseline supervised contrastive max_epochs=10
+b2c3d4e	0.338542	0.671875	0.796875	keep	harder sat augmentation + lower temperature
+c3d4e5f	0.329427	0.667969	0.792969	discard	too strong color jitter
+d4e5f6g	0.000000	0.000000	0.000000	crash	OOM at batch_size=64
 ```
-commit	R@1	R@5	elapsed_s	status	description
-a1b2c3d	0.003906	0.015625	180.2	keep	baseline: down_blocks ts=880 GeM
-b2c3d4e	0.002604	0.013021	175.0	discard	ts=400 (worse)
-c3d4e5f	0.007813	0.026042	185.0	keep	ts=950 + null text
-d4e5f6g	0.015625	0.052083	210.0	keep	PCA whiten 128d on top
-```
+
+Do not commit `results.tsv`.
 
 ## The experiment loop
 
-The experiment runs on a dedicated branch (e.g. `autoresearch/apr16`).
+The experiment runs on a dedicated branch (`autoresearch/supervised-dinov3`).
 
-**First run**: always run the baseline first (train.py as written) to establish the reference point.
+LOOP FOREVER:
 
-LOOP FOREVER (until R@1 ≥ 0.10 or manually interrupted):
+1. Look at git state: current branch/commit.
+2. Tune `train.py` with one experimental idea by directly hacking code.
+3. git commit.
+4. Run experiment: `uv run train.py > run.log 2>&1` (redirect everything — do NOT use tee or let output flood your context)
+5. Read out results from `run.log`.
+6. If metrics are missing, run crashed. Use `tail -n 50 run.log` and attempt fix; if not quickly fixable, log crash and move on.
+7. Record results in `results.tsv`.
+8. If `R@1` improved (higher), advance branch and keep commit.
+9. If `R@1` is equal/worse, reset to previous best commit.
 
-1. Review git state and results.tsv to understand where you are.
-2. Form a hypothesis. Consult the prior CSV files to avoid re-running known dead-ends.
-3. Edit `train.py` — changes can be large and exploratory, especially early on.
-4. `git commit` the change.
-5. `git push origin HEAD` — push immediately so results are visible upstream.
-6. Run training **in the background** (a full run exceeds the foreground tool timeout):
-   `uv run train.py > run.log 2>&1` with `run_in_background=true`. Wait for the completion notification.
-7. Extract metrics: `grep "^R@1:\|^R@5:\|^elapsed_s:" run.log`
-8. If grep is empty → crash. Read `tail -n 50 run.log`, fix if trivial, otherwise log as crash and discard.
-9. Log to `results.tsv`.
-10. If R@1 **improved** (strictly higher than current best): keep the commit, stay on it.
-11. If R@1 is equal or worse: `git reset --hard HEAD~1 && git push --force origin HEAD`.
+**Timeout**: Each experiment should take ~25 minutes total (+ a few seconds for startup and eval overhead). If a run exceeds 30 minutes, kill it and treat it as a failure (discard and revert).
 
-**Halt condition**: When R@1 ≥ 0.10 is first reached, log it, push, and stop. Print a clear summary of what worked.
+**Crashes**: If a run crashes (OOM, or a bug, or etc.), use your judgment: If it's something dumb and easy to fix (e.g. a typo, a missing import), fix it and re-run. If the idea itself is fundamentally broken, just skip it, log "crash" as the status in the tsv, and move on.
 
-**Timeout**: If a background run exceeds 14 minutes without completing, kill it with `pkill -f "uv run train.py"` and treat as crash.
+**NEVER STOP**: Once the experiment loop has begun (after the initial setup), do NOT pause to ask the human if you should continue. Do NOT ask "should I keep going?" or "is this a good stopping point?". The human might be asleep, or gone from a computer and expects you to continue working _indefinitely_ until you are manually stopped. You are autonomous. If you run out of ideas, think harder — re-read the in-scope files for new angles, try combining previous near-misses, try more radical architectural changes. The loop runs until the human interrupts you, period.
 
-If you run out of ideas: re-read the prior CSVs, look for near-misses in your own results.tsv, try combinations of things that individually helped a little.
+As an example use case, a user might leave you running while they sleep. If each experiment takes you ~30 minutes then you can run approx 2/hour, for a total of about 16 over the duration of the average human sleep. The user then wakes up to experimental results, all completed by you while they slept!
