@@ -48,6 +48,8 @@ from prepare import (
     evaluate_r1,
 )
 
+torch.set_float32_matmul_precision('high')
+
 # -----------------------------------------------------------------------------
 # Experiment defaults
 # -----------------------------------------------------------------------------
@@ -69,8 +71,8 @@ SAT_SCALES = {
     "11": 0.25,
 }
 
-DEFAULT_BATCH_SIZE = 384
-DEFAULT_EVAL_BATCH_SIZE = 384
+DEFAULT_BATCH_SIZE = 256
+DEFAULT_EVAL_BATCH_SIZE = 256
 DEFAULT_NUM_WORKERS = 8
 
 
@@ -186,7 +188,8 @@ class VisLocDataModule(pl.LightningDataModule):
 
         self.train_uav_transform = transforms.Compose(
             [
-                transforms.Resize((cfg.image_size, cfg.image_size)),
+                transforms.Resize(cfg.image_size),
+                transforms.CenterCrop((cfg.image_size, cfg.image_size)),
                 transforms.RandomHorizontalFlip(p=0.5),
                 transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.05),
                 transforms.ToTensor(),
@@ -205,7 +208,8 @@ class VisLocDataModule(pl.LightningDataModule):
         )
         self.eval_transform = transforms.Compose(
             [
-                transforms.Resize((cfg.image_size, cfg.image_size)),
+                transforms.Resize(cfg.image_size),
+                transforms.CenterCrop((cfg.image_size, cfg.image_size)),
                 transforms.ToTensor(),
                 transforms.Normalize(mean=mean, std=std),
             ]
@@ -249,8 +253,6 @@ class VisLocDataModule(pl.LightningDataModule):
             persistent_workers=self.cfg.num_workers > 0,
             drop_last=True,
         )
-        if self.cfg.num_workers > 0:
-            kwargs["prefetch_factor"] = 4
         return DataLoader(**kwargs)
 
     def val_dataloader(self):
@@ -261,8 +263,6 @@ class VisLocDataModule(pl.LightningDataModule):
             pin_memory=True,
             persistent_workers=self.cfg.num_workers > 0,
         )
-        if self.cfg.num_workers > 0:
-            common["prefetch_factor"] = 4
 
         uav_loader = DataLoader(self.val_uav_ds, **common)
         sat_loader = DataLoader(self.val_sat_ds, **common)
@@ -482,7 +482,7 @@ def main():
         precision=cfg.precision,
         logger=wandb_logger,
         callbacks=[ckpt_cb, early_stop_cb],
-        log_every_n_steps=20,
+        log_every_n_steps=5,
         benchmark=True,
     )
 
