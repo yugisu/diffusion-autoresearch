@@ -48,7 +48,7 @@ from prepare import (
     evaluate_r1,
 )
 
-torch.set_float32_matmul_precision('high')
+torch.set_float32_matmul_precision("high")
 
 # -----------------------------------------------------------------------------
 # Experiment defaults
@@ -97,7 +97,7 @@ class Config:
     seed: int = 42
 
     wandb_project: str = "autoresearch-supervised-dinov3"
-    wandb_run_name: str = "dinov3-supervised-visloc"
+    wandb_run_name: str | None = None
 
 
 # -----------------------------------------------------------------------------
@@ -140,10 +140,7 @@ class VisLocTrainPairDataset(Dataset):
             )
 
             uav_coords = np.array(
-                [
-                    (float(uav_ds.records.iloc[i]["lat"]), float(uav_ds.records.iloc[i]["lon"]))
-                    for i in range(len(uav_ds))
-                ]
+                [(float(uav_ds.records.iloc[i]["lat"]), float(uav_ds.records.iloc[i]["lon"])) for i in range(len(uav_ds))]
             )
             gt = build_ground_truth(uav_coords, sat_ds.chunk_bboxes)
 
@@ -153,10 +150,7 @@ class VisLocTrainPairDataset(Dataset):
 
             self.samples.extend([(flight, i) for i in range(len(uav_ds))])
 
-        print(
-            f"Train dataset: {len(self.samples)} UAV samples across {len(flights)} flights "
-            f"(paired with GPS-positive sat chunks)."
-        )
+        print(f"Train dataset: {len(self.samples)} UAV samples across {len(flights)} flights (paired with GPS-positive sat chunks).")
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -237,8 +231,7 @@ class VisLocDataModule(pl.LightningDataModule):
             )
 
             print(
-                f"Validation flight {VAL_FLIGHT}: "
-                f"{len(self.val_uav_ds)} UAV queries | {len(self.val_sat_ds)} sat chunks | scale={val_scale}"
+                f"Validation flight {VAL_FLIGHT}: {len(self.val_uav_ds)} UAV queries | {len(self.val_sat_ds)} sat chunks | scale={val_scale}"
             )
 
     def train_dataloader(self):
@@ -358,8 +351,7 @@ class DinoCrossViewRetriever(pl.LightningModule):
         self.log("val/R@1_gap_to_90", gap, prog_bar=False, sync_dist=False)
 
         print(
-            f"[VAL flight {VAL_FLIGHT}] R@1={metrics['R@1']:.4f} "
-            f"R@5={metrics['R@5']:.4f} R@10={metrics['R@10']:.4f} | gap_to_90={gap:.4f}"
+            f"[VAL flight {VAL_FLIGHT}] R@1={metrics['R@1']:.4f} R@5={metrics['R@5']:.4f} R@10={metrics['R@10']:.4f} | gap_to_90={gap:.4f}"
         )
 
     def configure_optimizers(self):
@@ -390,24 +382,24 @@ class DinoCrossViewRetriever(pl.LightningModule):
 def parse_args() -> Config:
     parser = argparse.ArgumentParser(description="Supervised DINOv3 fine-tuning for VisLoc retrieval")
 
-    parser.add_argument("--visloc-root", type=str, default=str(VISLOC_ROOT))
-    parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
-    parser.add_argument("--eval-batch-size", type=int, default=DEFAULT_EVAL_BATCH_SIZE)
-    parser.add_argument("--num-workers", type=int, default=DEFAULT_NUM_WORKERS)
-    parser.add_argument("--image-size", type=int, default=224)
-    parser.add_argument("--embedding-dim", type=int, default=512)
+    parser.add_argument("--visloc-root", type=str, default=Config.visloc_root)
+    parser.add_argument("--batch-size", type=int, default=Config.batch_size)
+    parser.add_argument("--eval-batch-size", type=int, default=Config.eval_batch_size)
+    parser.add_argument("--num-workers", type=int, default=Config.num_workers)
+    parser.add_argument("--image-size", type=int, default=Config.image_size)
+    parser.add_argument("--embedding-dim", type=int, default=Config.embedding_dim)
 
-    parser.add_argument("--lr", type=float, default=2e-5)
-    parser.add_argument("--weight-decay", type=float, default=1e-4)
-    parser.add_argument("--temperature", type=float, default=0.07)
+    parser.add_argument("--lr", type=float, default=Config.lr)
+    parser.add_argument("--weight-decay", type=float, default=Config.weight_decay)
+    parser.add_argument("--temperature", type=float, default=Config.temperature)
 
-    parser.add_argument("--max-epochs", type=int, default=10)
-    parser.add_argument("--max-steps", type=int, default=-1)
-    parser.add_argument("--precision", type=str, default="16-mixed")
-    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--max-epochs", type=int, default=Config.max_epochs)
+    parser.add_argument("--max-steps", type=int, default=Config.max_steps)
+    parser.add_argument("--precision", type=str, default=Config.precision)
+    parser.add_argument("--seed", type=int, default=Config.seed)
 
     parser.add_argument("--wandb-project", type=str, default="autoresearch-supervised-dinov3")
-    parser.add_argument("--wandb-run-name", type=str, default="dinov3-supervised-visloc")
+    parser.add_argument("--wandb-run-name", type=str, default=None)
     parser.add_argument("--model-name", type=str, default=DINO_MODEL)
 
     args = parser.parse_args()
@@ -448,8 +440,7 @@ def main():
     print(f"Satellite scales: {SAT_SCALES}")
     print(f"Data root: {cfg.visloc_root}")
     print(
-        f"Train config: batch_size={cfg.batch_size}, eval_batch_size={cfg.eval_batch_size}, "
-        f"num_workers={cfg.num_workers}, max_epochs={cfg.max_epochs}"
+        f"Train config: batch_size={cfg.batch_size}, eval_batch_size={cfg.eval_batch_size}, num_workers={cfg.num_workers}, max_epochs={cfg.max_epochs}"
     )
     print("=" * 80)
 
@@ -467,8 +458,6 @@ def main():
         monitor="val/R@1",
         mode="max",
         save_top_k=1,
-        filename="dinov3-{epoch:02d}-{step}",
-        auto_insert_metric_name=False,
     )
     early_stop_cb = EarlyStopping(monitor="val/R@1", mode="max", patience=6)
 
