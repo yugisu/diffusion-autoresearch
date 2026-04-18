@@ -167,6 +167,45 @@ class VisLocTrainPairDataset(Dataset):
         return uav_img, sat_img, uav_coords, sat_coords
 
 
+class TwoFlightBatchSampler(torch.utils.data.Sampler):
+    """Each batch draws from exactly 2 random flights (batch_size//2 each),
+    creating hard in-batch negatives from geographically adjacent satellite chunks."""
+
+    def __init__(self, dataset: VisLocTrainPairDataset, batch_size: int):
+        self.batch_size = batch_size
+        self.half = batch_size // 2
+        self.flight_indices: Dict[str, List[int]] = {}
+        for idx, (flight, _) in enumerate(dataset.samples):
+            self.flight_indices.setdefault(flight, []).append(idx)
+        self.flights = list(self.flight_indices.keys())
+
+    def __len__(self) -> int:
+        total = sum(len(v) for v in self.flight_indices.values())
+        return total // self.batch_size
+
+    def __iter__(self):
+        shuffled = {f: idx[:] for f, idx in self.flight_indices.items()}
+        for idxs in shuffled.values():
+            random.shuffle(idxs)
+        pointers = {f: 0 for f in self.flights}
+
+        n_batches = len(self)
+        for _ in range(n_batches):
+            chosen = random.sample(self.flights, min(2, len(self.flights)))
+            batch: List[int] = []
+            for f in chosen:
+                ptr = pointers[f]
+                idxs = shuffled[f]
+                end = ptr + self.half
+                if end > len(idxs):
+                    random.shuffle(idxs)
+                    ptr = 0
+                    end = self.half
+                batch.extend(idxs[ptr:end])
+                pointers[f] = end % len(idxs)
+            yield batch
+
+
 class VisLocDataModule(pl.LightningDataModule):
     def __init__(self, cfg: Config):
         super().__init__()
@@ -240,16 +279,14 @@ class VisLocDataModule(pl.LightningDataModule):
             )
 
     def train_dataloader(self):
-        kwargs = dict(
+        sampler = TwoFlightBatchSampler(self.train_ds, self.cfg.batch_size)
+        return DataLoader(
             dataset=self.train_ds,
-            batch_size=self.cfg.batch_size,
-            shuffle=True,
+            batch_sampler=sampler,
             num_workers=self.cfg.num_workers,
             pin_memory=True,
             persistent_workers=self.cfg.num_workers > 0,
-            drop_last=True,
         )
-        return DataLoader(**kwargs)
 
     def val_dataloader(self):
         common = dict(
