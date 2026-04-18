@@ -279,13 +279,8 @@ class DinoCrossViewRetriever(pl.LightningModule):
         self.backbone = AutoModel.from_pretrained(cfg.model_name, trust_remote_code=True)
         hidden = self.backbone.config.hidden_size
 
-        # Freeze first 4 blocks; train blocks 4-11 + norm with graduated LR
+        # Fully unfreeze all backbone blocks with LLRD
         for param in self.backbone.parameters():
-            param.requires_grad = False
-        for block in self.backbone.layer[4:]:
-            for param in block.parameters():
-                param.requires_grad = True
-        for param in self.backbone.norm.parameters():
             param.requires_grad = True
 
         self.proj = nn.Sequential(
@@ -386,14 +381,17 @@ class DinoCrossViewRetriever(pl.LightningModule):
         )
 
     def configure_optimizers(self):
-        lower_backbone_params = [p for blk in self.backbone.layer[4:8] for p in blk.parameters() if p.requires_grad]
-        upper_backbone_params = [p for blk in self.backbone.layer[8:] for p in blk.parameters() if p.requires_grad]
-        upper_backbone_params += [p for p in self.backbone.norm.parameters()]
+        early_backbone_params = [p for blk in self.backbone.layer[:4] for p in blk.parameters()]
+        early_backbone_params += list(self.backbone.embeddings.parameters())
+        mid_backbone_params = [p for blk in self.backbone.layer[4:8] for p in blk.parameters()]
+        late_backbone_params = [p for blk in self.backbone.layer[8:] for p in blk.parameters()]
+        late_backbone_params += list(self.backbone.norm.parameters())
         head_params = list(self.proj.parameters()) + [self.logit_scale]
 
         param_groups = [
-            {"params": lower_backbone_params, "lr": 1e-5},
-            {"params": upper_backbone_params, "lr": 2e-5},
+            {"params": early_backbone_params, "lr": 5e-6},
+            {"params": mid_backbone_params, "lr": 1e-5},
+            {"params": late_backbone_params, "lr": 2e-5},
             {"params": head_params, "lr": 5e-5},
         ]
         optimizer = AdamW(param_groups, weight_decay=self.cfg.weight_decay)
