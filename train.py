@@ -186,7 +186,9 @@ class VisLocDataModule(pl.LightningDataModule):
             [
                 transforms.Resize((cfg.image_size, cfg.image_size)),
                 transforms.RandomHorizontalFlip(p=0.5),
-                transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.05),
+                transforms.RandomPerspective(distortion_scale=0.2, p=0.5),
+                transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.3, hue=0.1),
+                transforms.GaussianBlur(kernel_size=5, sigma=(0.1, 2.0)),
                 transforms.ToTensor(),
                 transforms.Normalize(mean=mean, std=std),
             ]
@@ -195,8 +197,9 @@ class VisLocDataModule(pl.LightningDataModule):
             [
                 transforms.Resize((cfg.image_size, cfg.image_size)),
                 transforms.RandomHorizontalFlip(p=0.5),
-                transforms.RandomRotation(degrees=10),
-                transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.05),
+                transforms.RandomVerticalFlip(p=0.5),
+                transforms.RandomRotation(degrees=180),
+                transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.3, hue=0.1),
                 transforms.ToTensor(),
                 transforms.Normalize(mean=mean, std=std),
             ]
