@@ -351,13 +351,18 @@ class DinoCrossViewRetriever(pl.LightningModule):
 
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
         imgs, lat, lon = batch
-        emb = self.encode(imgs)
 
-        if dataloader_idx == 0:
+        if dataloader_idx == 0:  # UAV: no TTA
+            emb = self.encode(imgs)
             self._val_uav_embs.append(emb.detach().cpu())
             coords = torch.stack([lat, lon], dim=1)
             self._val_uav_coords.append(coords.detach().cpu())
-        else:
+        else:  # satellite: TTA over 4 cardinal rotations
+            e0 = self.encode(imgs)
+            e1 = self.encode(torch.rot90(imgs, 1, [2, 3]))
+            e2 = self.encode(torch.rot90(imgs, 2, [2, 3]))
+            e3 = self.encode(torch.rot90(imgs, 3, [2, 3]))
+            emb = F.normalize((e0 + e1 + e2 + e3) / 4.0, dim=-1)
             self._val_sat_embs.append(emb.detach().cpu())
 
     def on_validation_epoch_end(self):
