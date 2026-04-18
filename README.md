@@ -6,8 +6,8 @@ Results from autonomous research runs conducted with this framework:
 
 - **[SD v2.1 zero-shot UAV-to-satellite geo-localization](https://github.com/yugisu/diffusion-autoresearch/blob/autoresearch/apr16b/docs/stable-diffusion-zeroshot.md)** — 50 experiments using frozen SD v2.1 UNet features for cross-domain image retrieval. Best result: R@1 = 3.5% (branch `autoresearch/apr16b`).
 - **[DiffusionSat zero-shot UAV-to-satellite geo-localization](https://github.com/yugisu/diffusion-autoresearch/blob/autoresearch/diffusionsat/docs/diffusionsat-zeroshot.md)** — 20 experiments using frozen DiffusionSat UNet
-  features (SD v2.1 fine-tuned on satellite imagery). Best result: R@1 = 11.1%, a 3.2× improvement over vanilla SD v2.1 (branch
-  `autoresearch/diffusionsat`).
+  features (SD v2.1 fine-tuned on satellite imagery). Best result: R@1 = 11.1%, a 3.2x improvement over vanilla SD v2.1 (branch `autoresearch/diffusionsat`).
+- **[DINOv3 supervised fine-tuning - UAV-to-satellite geo-localization](https://github.com/yugisu/diffusion-autoresearch/blob/autoresearch/supervised-dinov3/docs/dinov3-supervised-fine-tuning.md)** - 16 experiments using DINOv3 as a base model. Best result: R@1 = 73.5%, a 2x improvement over zero-shot DINOv3 (branch `autoresearch/supervised-dinov3).
 
 ---
 
