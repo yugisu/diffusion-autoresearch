@@ -80,10 +80,10 @@ DEFAULT_NUM_WORKERS = 8
 class Config:
     visloc_root: str = str(VISLOC_ROOT)
     model_name: str = DINO_MODEL
-    image_size: int = 224
+    image_size: int = 336
     embedding_dim: int = 512
 
-    batch_size: int = DEFAULT_BATCH_SIZE
+    batch_size: int = 64
     eval_batch_size: int = DEFAULT_EVAL_BATCH_SIZE
     num_workers: int = DEFAULT_NUM_WORKERS
 
