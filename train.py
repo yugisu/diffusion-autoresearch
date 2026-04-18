@@ -32,7 +32,7 @@ import torch.nn.functional as F
 from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint
 from lightning.pytorch.loggers import WandbLogger
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
+from torch.optim.lr_scheduler import CosineAnnealingLR, CosineAnnealingWarmRestarts, LinearLR, SequentialLR
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 from transformers import AutoImageProcessor, AutoModel
@@ -438,16 +438,10 @@ class DinoCrossViewRetriever(pl.LightningModule):
         ]
         optimizer = AdamW(param_groups, weight_decay=self.cfg.weight_decay)
 
-        if self.trainer.max_steps is not None and self.trainer.max_steps > 0:
-            t_max = self.trainer.max_steps
-        else:
-            train_batches = max(len(self.trainer.datamodule.train_dataloader()), 1)
-            t_max = self.trainer.max_epochs * train_batches
-
-        warmup_steps = max(1, t_max // 10)  # 10% warmup
-        warmup = LinearLR(optimizer, start_factor=0.1, end_factor=1.0, total_iters=warmup_steps)
-        cosine = CosineAnnealingLR(optimizer, T_max=t_max - warmup_steps, eta_min=2e-5 * 0.05)
-        scheduler = SequentialLR(optimizer, schedulers=[warmup, cosine], milestones=[warmup_steps])
+        train_batches = max(len(self.trainer.datamodule.train_dataloader()), 1)
+        steps_per_epoch = train_batches
+        T_0 = 5 * steps_per_epoch  # restart every 5 epochs
+        scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=T_0, T_mult=1, eta_min=2e-5 * 0.05)
         return {
             "optimizer": optimizer,
             "lr_scheduler": {
