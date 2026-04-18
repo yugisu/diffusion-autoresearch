@@ -32,7 +32,7 @@ import torch.nn.functional as F
 from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint
 from lightning.pytorch.loggers import WandbLogger
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 from transformers import AutoImageProcessor, AutoModel
@@ -387,8 +387,8 @@ class DinoCrossViewRetriever(pl.LightningModule):
         head_params = list(self.proj.parameters()) + [self.logit_scale]
 
         param_groups = [
-            {"params": backbone_params, "lr": 5e-5},
-            {"params": head_params, "lr": 1e-4},
+            {"params": backbone_params, "lr": 2e-5},
+            {"params": head_params, "lr": 5e-5},
         ]
         optimizer = AdamW(param_groups, weight_decay=self.cfg.weight_decay)
 
@@ -398,7 +398,10 @@ class DinoCrossViewRetriever(pl.LightningModule):
             train_batches = max(len(self.trainer.datamodule.train_dataloader()), 1)
             t_max = self.trainer.max_epochs * train_batches
 
-        scheduler = CosineAnnealingLR(optimizer, T_max=t_max, eta_min=5e-5 * 0.05)
+        warmup_steps = max(1, t_max // 10)  # 10% warmup
+        warmup = LinearLR(optimizer, start_factor=0.1, end_factor=1.0, total_iters=warmup_steps)
+        cosine = CosineAnnealingLR(optimizer, T_max=t_max - warmup_steps, eta_min=2e-5 * 0.05)
+        scheduler = SequentialLR(optimizer, schedulers=[warmup, cosine], milestones=[warmup_steps])
         return {
             "optimizer": optimizer,
             "lr_scheduler": {
