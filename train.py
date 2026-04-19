@@ -84,11 +84,11 @@ class Config:
     image_size: int = 336
     embedding_dim: int = 768  # CLS token dim, no projection head
 
-    batch_size: int = 64
+    batch_size: int = 128
     eval_batch_size: int = 128
     num_workers: int = 8
 
-    lr: float = 2e-5
+    lr: float = 5e-6
     weight_decay: float = 1e-4
     temperature: float = 0.07
     warmup_epochs: int = 2
@@ -565,7 +565,7 @@ def main():
         mode="max",
         save_top_k=1,
     )
-    early_stop_cb = EarlyStopping(monitor="val/R@1", mode="max", patience=6)
+    early_stop_cb = EarlyStopping(monitor="val/R@1", mode="max", patience=3)
 
     trainer = pl.Trainer(
         accelerator="auto",
