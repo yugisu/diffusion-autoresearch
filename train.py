@@ -88,9 +88,10 @@ class Config:
     eval_batch_size: int = 128
     num_workers: int = 8
 
-    lr: float = 1e-4
+    lr: float = 2e-5
     weight_decay: float = 1e-4
     temperature: float = 0.07
+    warmup_epochs: int = 2
 
     lora_rank: int = 16
     lora_alpha: float = 32.0
@@ -355,7 +356,7 @@ class DinoSSLRetriever(pl.LightningModule):
             param.requires_grad = False
         self.backbone = apply_lora(self.backbone, rank=cfg.lora_rank, alpha=cfg.lora_alpha)
 
-        self.logit_scale = nn.Parameter(torch.tensor(np.log(1.0 / cfg.temperature), dtype=torch.float32))
+        self.temperature = cfg.temperature  # fixed temperature, no learnable scale
 
         self._val_uav_embs = []
         self._val_sat_embs = []
@@ -374,8 +375,7 @@ class DinoSSLRetriever(pl.LightningModule):
 
     def _infonce_loss(self, q: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
         """Symmetric InfoNCE: diagonal entries are positives."""
-        scale = self.logit_scale.exp().clamp(max=100)
-        logits = (q @ k.t()) * scale
+        logits = (q @ k.t()) / self.temperature
         labels = torch.arange(len(q), device=q.device)
         loss_qk = F.cross_entropy(logits, labels)
         loss_kq = F.cross_entropy(logits.t(), labels)
@@ -396,7 +396,6 @@ class DinoSSLRetriever(pl.LightningModule):
         elapsed = time.time() - self._train_start_time if self._train_start_time else 0
 
         self.log("train/loss", loss, on_step=True, on_epoch=True, prog_bar=True, batch_size=bs)
-        self.log("train/logit_scale", self.logit_scale.exp(), on_step=True, on_epoch=False)
         self.log("train/samples_seen", float(self._total_samples_seen), on_step=True, on_epoch=False)
         self.log("train/elapsed_s", elapsed, on_step=True, on_epoch=False)
         self.log("train/samples_per_sec", self._total_samples_seen / max(elapsed, 1), on_step=True, on_epoch=False)
@@ -446,11 +445,19 @@ class DinoSSLRetriever(pl.LightningModule):
         )
 
     def configure_optimizers(self):
-        # Only train LoRA params + logit_scale
         trainable = [p for p in self.parameters() if p.requires_grad]
         optimizer = AdamW(trainable, lr=self.cfg.lr, weight_decay=self.cfg.weight_decay)
 
-        scheduler = CosineAnnealingLR(optimizer, T_max=self.cfg.max_epochs, eta_min=self.cfg.lr * 0.01)
+        warmup = self.cfg.warmup_epochs
+        total = self.cfg.max_epochs
+
+        def lr_lambda(epoch):
+            if epoch < warmup:
+                return (epoch + 1) / warmup
+            progress = (epoch - warmup) / max(total - warmup, 1)
+            return 0.01 + 0.99 * 0.5 * (1 + math.cos(math.pi * progress))
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
         return {
             "optimizer": optimizer,
             "lr_scheduler": {
@@ -486,6 +493,7 @@ def parse_args() -> Config:
     parser.add_argument("--precision", type=str, default=Config.precision)
     parser.add_argument("--seed", type=int, default=Config.seed)
 
+    parser.add_argument("--warmup-epochs", type=int, default=Config.warmup_epochs)
     parser.add_argument("--wandb-project", type=str, default=Config.wandb_project)
     parser.add_argument("--wandb-run-name", type=str, default=None)
     parser.add_argument("--model-name", type=str, default=DINO_MODEL)
@@ -508,6 +516,7 @@ def parse_args() -> Config:
         max_steps=args.max_steps,
         precision=args.precision,
         seed=args.seed,
+        warmup_epochs=args.warmup_epochs,
         wandb_project=args.wandb_project,
         wandb_run_name=args.wandb_run_name,
     )
