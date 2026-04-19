@@ -1,14 +1,15 @@
 """
-Supervised DINOv3 training for VisLoc cross-view retrieval.
+Self-supervised DINOv3 training for VisLoc cross-view retrieval.
 
 Branch goal:
-- Fine-tune facebook/dinov3-vitb16-pretrain-lvd1689m with supervised contrastive learning
-- Train on flights: 01, 02, 04, 05, 06, 08, 09, 10, 11
-- Validate on flight: 03
+- Fine-tune facebook/dinov3-vitb16-pretrain-lvd1689m with self-supervised learning
+- Train on satellite chunks only from flights: 01, 02, 04, 05, 06, 08, 09, 10, 11
+- Validate on flight: 03 (768 UAV queries, 2860 satellite chunks)
 - Optimize for Recall@1 on fixed VisLoc evaluation
+- No UAV images during training — satellite chunks only
 
 Usage:
-  uv run train.py
+  uv run train.py > run.log 2>&1
 
 Environment (optional overrides):
   VISLOC_ROOT=/workspace/data/visloc
@@ -18,11 +19,13 @@ Environment (optional overrides):
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import random
+import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 import lightning.pytorch as pl
 import numpy as np
@@ -32,7 +35,7 @@ import torch.nn.functional as F
 from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint
 from lightning.pytorch.loggers import WandbLogger
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR, CosineAnnealingWarmRestarts, LinearLR, SequentialLR
+from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 from transformers import AutoImageProcessor, AutoModel
@@ -58,6 +61,8 @@ DINO_MODEL = "facebook/dinov3-vitb16-pretrain-lvd1689m"
 TRAIN_FLIGHTS = ["01", "02", "04", "05", "06", "08", "09", "10", "11"]
 VAL_FLIGHT = "03"
 
+TRAIN_STRIDE = 64  # denser stride for SSL training (~4x more chunks)
+
 SAT_SCALES = {
     "01": 0.25,
     "02": 0.25,
@@ -71,44 +76,110 @@ SAT_SCALES = {
     "11": 0.25,
 }
 
-DEFAULT_BATCH_SIZE = 128
-DEFAULT_EVAL_BATCH_SIZE = 128
-DEFAULT_NUM_WORKERS = 8
-
 
 @dataclass
 class Config:
     visloc_root: str = str(VISLOC_ROOT)
     model_name: str = DINO_MODEL
     image_size: int = 336
-    embedding_dim: int = 512
+    embedding_dim: int = 768  # CLS token dim, no projection head
 
     batch_size: int = 64
-    eval_batch_size: int = DEFAULT_EVAL_BATCH_SIZE
-    num_workers: int = DEFAULT_NUM_WORKERS
+    eval_batch_size: int = 128
+    num_workers: int = 8
 
-    lr: float = 1e-5
+    lr: float = 1e-4
     weight_decay: float = 1e-4
     temperature: float = 0.07
+
+    lora_rank: int = 16
+    lora_alpha: float = 32.0
+
+    iou_pos_threshold: float = 0.25
+    iou_neg_threshold: float = 0.0  # IoU == 0 → negative
 
     max_epochs: int = 20
     max_steps: int = -1
     precision: str = "16-mixed"
     seed: int = 42
 
-    wandb_project: str = "autoresearch-supervised-dinov3"
+    wandb_project: str = "autoresearch-ssl-dinov3"
     wandb_run_name: str | None = None
 
 
 # -----------------------------------------------------------------------------
-# Datasets
+# LoRA implementation
 # -----------------------------------------------------------------------------
 
 
-class VisLocTrainPairDataset(Dataset):
+class LoRALinear(nn.Module):
+    """Low-Rank Adaptation for nn.Linear layers."""
+
+    def __init__(self, orig: nn.Linear, rank: int = 16, alpha: float = 32.0):
+        super().__init__()
+        self.orig = orig
+        self.rank = rank
+        self.alpha = alpha
+        self.scaling = alpha / rank
+
+        # Freeze original weights
+        for p in self.orig.parameters():
+            p.requires_grad = False
+
+        # LoRA matrices
+        self.lora_A = nn.Parameter(torch.zeros(rank, orig.in_features))
+        self.lora_B = nn.Parameter(torch.zeros(orig.out_features, rank))
+        nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
+        # B initialized to zero so LoRA starts as identity
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        base = self.orig(x)
+        lora = (x @ self.lora_A.t()) @ self.lora_B.t() * self.scaling
+        return base + lora
+
+
+def apply_lora(model: nn.Module, rank: int = 16, alpha: float = 32.0) -> nn.Module:
+    """Apply LoRA to all qkv projection layers in the ViT backbone."""
+    for name, module in model.named_modules():
+        if isinstance(module, nn.Linear) and any(
+            k in name for k in ("query", "key", "value", "qkv", "q_proj", "k_proj", "v_proj")
+        ):
+            parent_name = ".".join(name.split(".")[:-1])
+            attr_name = name.split(".")[-1]
+            parent = model
+            for part in parent_name.split("."):
+                if part:
+                    parent = getattr(parent, part)
+            setattr(parent, attr_name, LoRALinear(getattr(parent, attr_name), rank, alpha))
+    return model
+
+
+# -----------------------------------------------------------------------------
+# SSL Dataset — satellite chunks only, IoU-based positive mining
+# -----------------------------------------------------------------------------
+
+
+def compute_iou(box_a: Tuple[float, ...], box_b: Tuple[float, ...]) -> float:
+    """Compute IoU between two (lat_min, lon_min, lat_max, lon_max) bboxes."""
+    lat_min = max(box_a[0], box_b[0])
+    lon_min = max(box_a[1], box_b[1])
+    lat_max = min(box_a[2], box_b[2])
+    lon_max = min(box_a[3], box_b[3])
+
+    if lat_min >= lat_max or lon_min >= lon_max:
+        return 0.0
+
+    inter = (lat_max - lat_min) * (lon_max - lon_min)
+    area_a = (box_a[2] - box_a[0]) * (box_a[3] - box_a[1])
+    area_b = (box_b[2] - box_b[0]) * (box_b[3] - box_b[1])
+    union = area_a + area_b - inter
+    return inter / union if union > 0 else 0.0
+
+
+class SatSSLDataset(Dataset):
     """
-    Creates supervised UAV->satellite positive pairs from GPS overlap.
-    For each UAV image, positives are chunk indices from build_ground_truth(...).
+    Self-supervised satellite chunk pairs based on IoU overlap.
+    For each anchor chunk, samples a positive (IoU > threshold) from the same flight.
     """
 
     def __init__(
@@ -116,97 +187,75 @@ class VisLocTrainPairDataset(Dataset):
         root: str,
         flights: List[str],
         sat_scales: Dict[str, float],
-        uav_transform,
-        sat_transform,
+        transform,
+        iou_pos_threshold: float = 0.25,
     ):
-        self.root = root
-        self.flights = flights
-        self.uav_datasets: Dict[str, UAVDataset] = {}
+        self.transform = transform
+        self.iou_pos_threshold = iou_pos_threshold
+
         self.sat_datasets: Dict[str, SatChunkDataset] = {}
-        self.samples: List[tuple[str, int]] = []
-        self.gt_per_flight: Dict[str, List[List[int]]] = {}
+        self.samples: List[Tuple[str, int]] = []  # (flight, chunk_idx)
+        self.positives: Dict[str, List[List[int]]] = {}  # flight -> [chunk_idx -> [positive_indices]]
 
         for flight in flights:
             scale = sat_scales.get(flight, MAP_SCALE_FACTOR)
-
-            uav_ds = UAVDataset(root, flight, transform=uav_transform)
             sat_ds = SatChunkDataset(
                 root,
                 flight,
                 chunk_pixels=CHUNK_PIXELS,
-                stride_pixels=CHUNK_STRIDE,
+                stride_pixels=TRAIN_STRIDE,
                 scale_factor=scale,
-                transform=sat_transform,
+                transform=None,  # apply transform in __getitem__
             )
-
-            uav_coords = np.array(
-                [(float(uav_ds.records.iloc[i]["lat"]), float(uav_ds.records.iloc[i]["lon"])) for i in range(len(uav_ds))]
-            )
-            gt = build_ground_truth(uav_coords, sat_ds.chunk_bboxes)
-
-            self.uav_datasets[flight] = uav_ds
             self.sat_datasets[flight] = sat_ds
-            self.gt_per_flight[flight] = gt
 
-            self.samples.extend([(flight, i) for i in range(len(uav_ds))])
+            # Precompute positive pairs based on IoU
+            bboxes = sat_ds.chunk_bboxes
+            n = len(bboxes)
+            pos_lists: List[List[int]] = [[] for _ in range(n)]
 
-        print(f"Train dataset: {len(self.samples)} UAV samples across {len(flights)} flights (paired with GPS-positive sat chunks).")
+            for i in range(n):
+                for j in range(i + 1, n):
+                    iou = compute_iou(bboxes[i], bboxes[j])
+                    if iou > iou_pos_threshold:
+                        pos_lists[i].append(j)
+                        pos_lists[j].append(i)
+
+            # Only keep chunks that have at least one positive
+            valid_chunks = [i for i in range(n) if len(pos_lists[i]) > 0]
+            self.positives[flight] = pos_lists
+            self.samples.extend([(flight, i) for i in valid_chunks])
+
+        print(f"SSL dataset: {len(self.samples)} anchor chunks across {len(flights)} flights (IoU>{iou_pos_threshold})")
 
     def __len__(self) -> int:
         return len(self.samples)
 
     def __getitem__(self, idx: int):
-        flight, uav_idx = self.samples[idx]
-        gt_candidates = self.gt_per_flight[flight][uav_idx]
-        sat_idx = random.choice(gt_candidates)
+        flight, anchor_idx = self.samples[idx]
+        pos_candidates = self.positives[flight][anchor_idx]
+        pos_idx = random.choice(pos_candidates)
 
-        uav_img, uav_lat, uav_lon = self.uav_datasets[flight][uav_idx]
-        sat_img, sat_lat, sat_lon = self.sat_datasets[flight][sat_idx]
-        uav_coords = torch.tensor([uav_lat, uav_lon], dtype=torch.float32)
-        sat_coords = torch.tensor([sat_lat, sat_lon], dtype=torch.float32)
-        return uav_img, sat_img, uav_coords, sat_coords
+        sat_ds = self.sat_datasets[flight]
+        anchor_img, anchor_lat, anchor_lon = sat_ds[anchor_idx]
+        pos_img, pos_lat, pos_lon = sat_ds[pos_idx]
 
+        # Apply transforms
+        if self.transform:
+            anchor_img = self.transform(anchor_img)
+            pos_img = self.transform(pos_img)
 
-class TwoFlightBatchSampler(torch.utils.data.Sampler):
-    """Each batch draws from exactly 2 random flights (batch_size//2 each),
-    creating hard in-batch negatives from geographically adjacent satellite chunks."""
-
-    def __init__(self, dataset: VisLocTrainPairDataset, batch_size: int):
-        self.batch_size = batch_size
-        self.half = batch_size // 2
-        self.flight_indices: Dict[str, List[int]] = {}
-        for idx, (flight, _) in enumerate(dataset.samples):
-            self.flight_indices.setdefault(flight, []).append(idx)
-        self.flights = list(self.flight_indices.keys())
-
-    def __len__(self) -> int:
-        total = sum(len(v) for v in self.flight_indices.values())
-        return total // self.batch_size
-
-    def __iter__(self):
-        shuffled = {f: idx[:] for f, idx in self.flight_indices.items()}
-        for idxs in shuffled.values():
-            random.shuffle(idxs)
-        pointers = {f: 0 for f in self.flights}
-
-        n_batches = len(self)
-        for _ in range(n_batches):
-            chosen = random.sample(self.flights, min(2, len(self.flights)))
-            batch: List[int] = []
-            for f in chosen:
-                ptr = pointers[f]
-                idxs = shuffled[f]
-                end = ptr + self.half
-                if end > len(idxs):
-                    random.shuffle(idxs)
-                    ptr = 0
-                    end = self.half
-                batch.extend(idxs[ptr:end])
-                pointers[f] = end % len(idxs)
-            yield batch
+        anchor_coords = torch.tensor([anchor_lat, anchor_lon], dtype=torch.float32)
+        pos_coords = torch.tensor([pos_lat, pos_lon], dtype=torch.float32)
+        return anchor_img, pos_img, anchor_coords, pos_coords
 
 
-class VisLocDataModule(pl.LightningDataModule):
+# -----------------------------------------------------------------------------
+# Data module
+# -----------------------------------------------------------------------------
+
+
+class VisLocSSLDataModule(pl.LightningDataModule):
     def __init__(self, cfg: Config):
         super().__init__()
         self.cfg = cfg
@@ -217,28 +266,16 @@ class VisLocDataModule(pl.LightningDataModule):
         self.val_sat_ds = None
 
         self.processor = AutoImageProcessor.from_pretrained(cfg.model_name, trust_remote_code=True)
-
         mean = self.processor.image_mean
         std = self.processor.image_std
 
-        self.train_uav_transform = transforms.Compose(
-            [
-                transforms.Resize((cfg.image_size, cfg.image_size)),
-                transforms.RandomHorizontalFlip(p=0.5),
-                transforms.RandomPerspective(distortion_scale=0.2, p=0.5),
-                transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.3, hue=0.1),
-                transforms.GaussianBlur(kernel_size=5, sigma=(0.1, 2.0)),
-                transforms.ToTensor(),
-                transforms.Normalize(mean=mean, std=std),
-            ]
-        )
-        self.train_sat_transform = transforms.Compose(
+        self.train_transform = transforms.Compose(
             [
                 transforms.Resize((cfg.image_size, cfg.image_size)),
                 transforms.RandomHorizontalFlip(p=0.5),
                 transforms.RandomVerticalFlip(p=0.5),
-                transforms.RandomRotation(degrees=180),
-                transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.3, hue=0.1),
+                transforms.RandomRotation(degrees=90),
+                transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0, hue=0),
                 transforms.ToTensor(),
                 transforms.Normalize(mean=mean, std=std),
             ]
@@ -253,17 +290,16 @@ class VisLocDataModule(pl.LightningDataModule):
 
     def setup(self, stage: str | None = None):
         if self.train_ds is None:
-            self.train_ds = VisLocTrainPairDataset(
+            self.train_ds = SatSSLDataset(
                 root=self.root,
                 flights=TRAIN_FLIGHTS,
                 sat_scales=SAT_SCALES,
-                uav_transform=self.train_uav_transform,
-                sat_transform=self.train_sat_transform,
+                transform=self.train_transform,
+                iou_pos_threshold=self.cfg.iou_pos_threshold,
             )
 
         if self.val_uav_ds is None or self.val_sat_ds is None:
             val_scale = SAT_SCALES.get(VAL_FLIGHT, MAP_SCALE_FACTOR)
-
             self.val_uav_ds = UAVDataset(self.root, VAL_FLIGHT, transform=self.eval_transform)
             self.val_sat_ds = SatChunkDataset(
                 self.root,
@@ -273,19 +309,19 @@ class VisLocDataModule(pl.LightningDataModule):
                 scale_factor=val_scale,
                 transform=self.eval_transform,
             )
-
             print(
                 f"Validation flight {VAL_FLIGHT}: {len(self.val_uav_ds)} UAV queries | {len(self.val_sat_ds)} sat chunks | scale={val_scale}"
             )
 
     def train_dataloader(self):
-        sampler = TwoFlightBatchSampler(self.train_ds, self.cfg.batch_size)
         return DataLoader(
             dataset=self.train_ds,
-            batch_sampler=sampler,
+            batch_size=self.cfg.batch_size,
+            shuffle=True,
             num_workers=self.cfg.num_workers,
             pin_memory=True,
             persistent_workers=self.cfg.num_workers > 0,
+            drop_last=True,
         )
 
     def val_dataloader(self):
@@ -296,7 +332,6 @@ class VisLocDataModule(pl.LightningDataModule):
             pin_memory=True,
             persistent_workers=self.cfg.num_workers > 0,
         )
-
         uav_loader = DataLoader(self.val_uav_ds, **common)
         sat_loader = DataLoader(self.val_sat_ds, **common)
         return [uav_loader, sat_loader]
@@ -307,78 +342,64 @@ class VisLocDataModule(pl.LightningDataModule):
 # -----------------------------------------------------------------------------
 
 
-class DinoCrossViewRetriever(pl.LightningModule):
+class DinoSSLRetriever(pl.LightningModule):
     def __init__(self, cfg: Config):
         super().__init__()
         self.cfg = cfg
         self.save_hyperparameters(vars(cfg))
 
         self.backbone = AutoModel.from_pretrained(cfg.model_name, trust_remote_code=True)
-        hidden = self.backbone.config.hidden_size
 
-        # Fully unfreeze all backbone blocks with LLRD
+        # Freeze backbone, then apply LoRA
         for param in self.backbone.parameters():
-            param.requires_grad = True
-
-        self.proj = nn.Sequential(
-            nn.Linear(hidden, hidden),
-            nn.GELU(),
-            nn.Dropout(0.1),
-            nn.Linear(hidden, cfg.embedding_dim),
-        )
+            param.requires_grad = False
+        self.backbone = apply_lora(self.backbone, rank=cfg.lora_rank, alpha=cfg.lora_alpha)
 
         self.logit_scale = nn.Parameter(torch.tensor(np.log(1.0 / cfg.temperature), dtype=torch.float32))
 
         self._val_uav_embs = []
         self._val_sat_embs = []
         self._val_uav_coords = []
+        self._total_samples_seen = 0
+        self._train_start_time = None
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
+        """Extract CLS token embedding (768-d, no projection head)."""
         out = self.backbone(pixel_values=x)
         cls = out.last_hidden_state[:, 0]
-        emb = self.proj(cls)
-        emb = F.normalize(emb, dim=-1)
-        return emb
+        return F.normalize(cls, dim=-1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.encode(x)
 
-    def _multi_pos_infonce(self, q: torch.Tensor, k: torch.Tensor, pos_mask: torch.Tensor) -> torch.Tensor:
-        """Multi-positive InfoNCE: pos_mask[i,j]=1 means (query_i, key_j) is a positive pair."""
+    def _infonce_loss(self, q: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
+        """Symmetric InfoNCE: diagonal entries are positives."""
         scale = self.logit_scale.exp().clamp(max=100)
-        logits = (q @ k.t()) * scale  # (B, B)
-        log_probs = F.log_softmax(logits, dim=1)
-        n_pos = pos_mask.sum(dim=1).clamp(min=1)
-        loss_qk = -(log_probs * pos_mask).sum(dim=1) / n_pos
-        log_probs_t = F.log_softmax(logits.t(), dim=1)
-        n_pos_t = pos_mask.t().sum(dim=1).clamp(min=1)
-        loss_kq = -(log_probs_t * pos_mask.t()).sum(dim=1) / n_pos_t
-        return 0.5 * (loss_qk.mean() + loss_kq.mean())
+        logits = (q @ k.t()) * scale
+        labels = torch.arange(len(q), device=q.device)
+        loss_qk = F.cross_entropy(logits, labels)
+        loss_kq = F.cross_entropy(logits.t(), labels)
+        return 0.5 * (loss_qk + loss_kq)
 
-    def _build_pos_mask(self, uav_coords: torch.Tensor, sat_coords: torch.Tensor, threshold_m: float = 100.0) -> torch.Tensor:
-        """GPS-proximity positive mask: (B, B) float, 1 if UAV_i GPS is within threshold_m of sat_j center."""
-        uav_lat = uav_coords[:, 0].cpu().numpy()
-        uav_lon = uav_coords[:, 1].cpu().numpy()
-        sat_lat = sat_coords[:, 0].cpu().numpy()
-        sat_lon = sat_coords[:, 1].cpu().numpy()
-        dlat = (sat_lat[None, :] - uav_lat[:, None]) * 111111.0
-        mean_lat = np.radians((uav_lat[:, None] + sat_lat[None, :]) / 2.0)
-        dlon = (sat_lon[None, :] - uav_lon[:, None]) * 111111.0 * np.cos(mean_lat)
-        dist = np.sqrt(dlat ** 2 + dlon ** 2)
-        mask = torch.tensor(dist < threshold_m, dtype=torch.float32, device=uav_coords.device)
-        # Diagonal always positive
-        mask = (mask + torch.eye(len(uav_lat), device=mask.device)).clamp(max=1.0)
-        return mask
+    def on_train_start(self):
+        self._train_start_time = time.time()
 
     def training_step(self, batch, batch_idx):
-        uav, sat, uav_coords, sat_coords = batch
-        q = self.encode(uav)
-        k = self.encode(sat)
+        anchor, positive, anchor_coords, pos_coords = batch
+        q = self.encode(anchor)
+        k = self.encode(positive)
 
-        pos_mask = self._build_pos_mask(uav_coords, sat_coords)
-        loss = self._multi_pos_infonce(q, k, pos_mask)
-        self.log("train/loss", loss, on_step=True, on_epoch=True, prog_bar=True, batch_size=uav.size(0))
-        self.log("train/logit_scale", self.logit_scale.exp(), on_step=True, on_epoch=False, prog_bar=False)
+        loss = self._infonce_loss(q, k)
+
+        bs = anchor.size(0)
+        self._total_samples_seen += bs
+        elapsed = time.time() - self._train_start_time if self._train_start_time else 0
+
+        self.log("train/loss", loss, on_step=True, on_epoch=True, prog_bar=True, batch_size=bs)
+        self.log("train/logit_scale", self.logit_scale.exp(), on_step=True, on_epoch=False)
+        self.log("train/samples_seen", float(self._total_samples_seen), on_step=True, on_epoch=False)
+        self.log("train/elapsed_s", elapsed, on_step=True, on_epoch=False)
+        self.log("train/samples_per_sec", self._total_samples_seen / max(elapsed, 1), on_step=True, on_epoch=False)
         return loss
 
     def on_validation_epoch_start(self):
@@ -389,12 +410,12 @@ class DinoCrossViewRetriever(pl.LightningModule):
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
         imgs, lat, lon = batch
 
-        if dataloader_idx == 0:  # UAV: no TTA
+        if dataloader_idx == 0:  # UAV queries
             emb = self.encode(imgs)
             self._val_uav_embs.append(emb.detach().cpu())
             coords = torch.stack([lat, lon], dim=1)
             self._val_uav_coords.append(coords.detach().cpu())
-        else:  # satellite: TTA over 4 cardinal rotations
+        else:  # satellite gallery — TTA over 4 rotations
             e0 = self.encode(imgs)
             e1 = self.encode(torch.rot90(imgs, 1, [2, 3]))
             e2 = self.encode(torch.rot90(imgs, 2, [2, 3]))
@@ -417,36 +438,24 @@ class DinoCrossViewRetriever(pl.LightningModule):
         self.log("val/R@5", float(metrics["R@5"]), prog_bar=False, sync_dist=False)
         self.log("val/R@10", float(metrics["R@10"]), prog_bar=False, sync_dist=False)
 
+        elapsed = time.time() - self._train_start_time if self._train_start_time else 0
         gap = 0.90 - float(metrics["R@1"])
         print(
-            f"[VAL flight {VAL_FLIGHT}] R@1={metrics['R@1']:.4f} R@5={metrics['R@5']:.4f} R@10={metrics['R@10']:.4f} | gap_to_90={gap:.4f}"
+            f"[VAL flight {VAL_FLIGHT}] R@1={metrics['R@1']:.4f} R@5={metrics['R@5']:.4f} R@10={metrics['R@10']:.4f}"
+            f" | gap_to_90={gap:.4f} | elapsed={elapsed:.0f}s | samples_seen={self._total_samples_seen}"
         )
 
     def configure_optimizers(self):
-        early_backbone_params = [p for blk in self.backbone.layer[:4] for p in blk.parameters()]
-        early_backbone_params += list(self.backbone.embeddings.parameters())
-        mid_backbone_params = [p for blk in self.backbone.layer[4:8] for p in blk.parameters()]
-        late_backbone_params = [p for blk in self.backbone.layer[8:] for p in blk.parameters()]
-        late_backbone_params += list(self.backbone.norm.parameters())
-        head_params = list(self.proj.parameters()) + [self.logit_scale]
+        # Only train LoRA params + logit_scale
+        trainable = [p for p in self.parameters() if p.requires_grad]
+        optimizer = AdamW(trainable, lr=self.cfg.lr, weight_decay=self.cfg.weight_decay)
 
-        param_groups = [
-            {"params": early_backbone_params, "lr": 5e-6},
-            {"params": mid_backbone_params, "lr": 1e-5},
-            {"params": late_backbone_params, "lr": 2e-5},
-            {"params": head_params, "lr": 5e-5},
-        ]
-        optimizer = AdamW(param_groups, weight_decay=self.cfg.weight_decay)
-
-        train_batches = max(len(self.trainer.datamodule.train_dataloader()), 1)
-        steps_per_epoch = train_batches
-        T_0 = 5 * steps_per_epoch  # restart every 5 epochs
-        scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=T_0, T_mult=1, eta_min=2e-5 * 0.05)
+        scheduler = CosineAnnealingLR(optimizer, T_max=self.cfg.max_epochs, eta_min=self.cfg.lr * 0.01)
         return {
             "optimizer": optimizer,
             "lr_scheduler": {
                 "scheduler": scheduler,
-                "interval": "step",
+                "interval": "epoch",
             },
         }
 
@@ -457,25 +466,27 @@ class DinoCrossViewRetriever(pl.LightningModule):
 
 
 def parse_args() -> Config:
-    parser = argparse.ArgumentParser(description="Supervised DINOv3 fine-tuning for VisLoc retrieval")
+    parser = argparse.ArgumentParser(description="Self-supervised DINOv3 fine-tuning for VisLoc retrieval")
 
     parser.add_argument("--visloc-root", type=str, default=Config.visloc_root)
     parser.add_argument("--batch-size", type=int, default=Config.batch_size)
     parser.add_argument("--eval-batch-size", type=int, default=Config.eval_batch_size)
     parser.add_argument("--num-workers", type=int, default=Config.num_workers)
     parser.add_argument("--image-size", type=int, default=Config.image_size)
-    parser.add_argument("--embedding-dim", type=int, default=Config.embedding_dim)
 
     parser.add_argument("--lr", type=float, default=Config.lr)
     parser.add_argument("--weight-decay", type=float, default=Config.weight_decay)
     parser.add_argument("--temperature", type=float, default=Config.temperature)
+
+    parser.add_argument("--lora-rank", type=int, default=Config.lora_rank)
+    parser.add_argument("--lora-alpha", type=float, default=Config.lora_alpha)
 
     parser.add_argument("--max-epochs", type=int, default=Config.max_epochs)
     parser.add_argument("--max-steps", type=int, default=Config.max_steps)
     parser.add_argument("--precision", type=str, default=Config.precision)
     parser.add_argument("--seed", type=int, default=Config.seed)
 
-    parser.add_argument("--wandb-project", type=str, default="autoresearch-supervised-dinov3")
+    parser.add_argument("--wandb-project", type=str, default=Config.wandb_project)
     parser.add_argument("--wandb-run-name", type=str, default=None)
     parser.add_argument("--model-name", type=str, default=DINO_MODEL)
 
@@ -485,13 +496,14 @@ def parse_args() -> Config:
         visloc_root=args.visloc_root,
         model_name=args.model_name,
         image_size=args.image_size,
-        embedding_dim=args.embedding_dim,
         batch_size=args.batch_size,
         eval_batch_size=args.eval_batch_size,
         num_workers=args.num_workers,
         lr=args.lr,
         weight_decay=args.weight_decay,
         temperature=args.temperature,
+        lora_rank=args.lora_rank,
+        lora_alpha=args.lora_alpha,
         max_epochs=args.max_epochs,
         max_steps=args.max_steps,
         precision=args.precision,
@@ -510,19 +522,27 @@ def main():
         cfg.visloc_root = os.environ["VISLOC_ROOT"]
 
     print("=" * 80)
-    print("Supervised DINOv3 on VisLoc")
+    print("Self-Supervised DINOv3 on VisLoc (satellite chunks only)")
     print(f"Model: {cfg.model_name}")
     print(f"Train flights: {TRAIN_FLIGHTS}")
     print(f"Val flight: {VAL_FLIGHT}")
     print(f"Satellite scales: {SAT_SCALES}")
+    print(f"Training stride: {TRAIN_STRIDE} (eval stride: {CHUNK_STRIDE})")
+    print(f"LoRA rank={cfg.lora_rank}, alpha={cfg.lora_alpha}")
     print(f"Data root: {cfg.visloc_root}")
     print(
-        f"Train config: batch_size={cfg.batch_size}, eval_batch_size={cfg.eval_batch_size}, num_workers={cfg.num_workers}, max_epochs={cfg.max_epochs}"
+        f"Train config: batch_size={cfg.batch_size}, eval_batch_size={cfg.eval_batch_size},"
+        f" num_workers={cfg.num_workers}, max_epochs={cfg.max_epochs}"
     )
     print("=" * 80)
 
-    datamodule = VisLocDataModule(cfg)
-    model = DinoCrossViewRetriever(cfg)
+    datamodule = VisLocSSLDataModule(cfg)
+    model = DinoSSLRetriever(cfg)
+
+    # Count trainable params
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total = sum(p.numel() for p in model.parameters())
+    print(f"Trainable params: {trainable:,} / {total:,} ({100*trainable/total:.2f}%)")
 
     wandb_logger = WandbLogger(
         project=cfg.wandb_project,
@@ -531,7 +551,7 @@ def main():
     )
 
     ckpt_cb = ModelCheckpoint(
-        dirpath="checkpoints/supervised-dinov3",
+        dirpath="checkpoints/ssl-dinov3",
         monitor="val/R@1",
         mode="max",
         save_top_k=1,
@@ -551,6 +571,14 @@ def main():
     )
 
     trainer.fit(model, datamodule=datamodule)
+
+    # Upload run.log as wandb artifact
+    if os.path.exists("run.log"):
+        import wandb
+
+        artifact = wandb.Artifact("run-log", type="log")
+        artifact.add_file("run.log")
+        wandb_logger.experiment.log_artifact(artifact)
 
     print("Best checkpoint:", ckpt_cb.best_model_path)
     print("Best val/R@1:", float(ckpt_cb.best_model_score) if ckpt_cb.best_model_score is not None else None)
