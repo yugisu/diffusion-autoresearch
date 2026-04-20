@@ -92,7 +92,7 @@ class Config:
     weight_decay: float = 1e-4
     temperature: float = 0.07
     warmup_epochs: int = 2
-    proj_dim: int = 256  # projection head output dim (0 = disabled, use raw CLS for SSL)
+    proj_dim: int = 0  # projection head output dim (0 = disabled, use raw CLS for SSL)
 
     georank_weight: float = 0.0  # weight for GeoRank regularization (0 = disabled)
     cosine_t0: int = 0  # CosineAnnealingWarmRestarts period (0 = plain cosine decay)
@@ -267,21 +267,25 @@ class VisLocSSLDataModule(pl.LightningDataModule):
         mean = self.processor.image_mean
         std = self.processor.image_std
 
-        aug = [
+        shared_aug = [
             transforms.RandomHorizontalFlip(p=0.5),
             transforms.RandomVerticalFlip(p=0.5),
-            transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0, hue=0),
             transforms.ToTensor(),
             transforms.Normalize(mean=mean, std=std),
         ]
-        # Anchor: zoomed-in crop (25-50% of area) — simulates UAV high-res close-up
-        self.anchor_transform = transforms.Compose([
+        # Anchor: zoomed-in UAV-like crop + stronger sensor/temporal augmentation
+        anchor_aug = [
             transforms.RandomResizedCrop(cfg.image_size, scale=(0.25, 0.50), ratio=(0.9, 1.1)),
-        ] + aug)
-        # Positive: full-scale view (75-100% of area) — simulates satellite wide view
+            transforms.ColorJitter(brightness=0.5, contrast=0.5, saturation=0.3, hue=0.1),
+            transforms.RandomGrayscale(p=0.1),
+            transforms.GaussianBlur(kernel_size=9, sigma=(0.1, 2.0)),
+        ]
+        self.anchor_transform = transforms.Compose(anchor_aug + shared_aug)
+        # Positive: full-scale satellite view — mild augmentation only
         self.positive_transform = transforms.Compose([
             transforms.RandomResizedCrop(cfg.image_size, scale=(0.75, 1.00), ratio=(0.9, 1.1)),
-        ] + aug)
+            transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0, hue=0),
+        ] + shared_aug)
         # Kept for eval (not used for training)
         self.train_transform = self.anchor_transform
         self.eval_transform = transforms.Compose(
