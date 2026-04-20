@@ -93,6 +93,11 @@ class Config:
     temperature: float = 0.07
     warmup_epochs: int = 2
 
+    # VICReg loss weights
+    vicreg_lambda: float = 25.0  # invariance
+    vicreg_mu: float = 25.0      # variance
+    vicreg_nu: float = 1.0       # covariance
+
     lora_rank: int = 16
     lora_alpha: float = 32.0
 
@@ -356,8 +361,6 @@ class DinoSSLRetriever(pl.LightningModule):
             param.requires_grad = False
         self.backbone = apply_lora(self.backbone, rank=cfg.lora_rank, alpha=cfg.lora_alpha)
 
-        self.temperature = cfg.temperature  # fixed temperature, no learnable scale
-
         self._val_uav_embs = []
         self._val_sat_embs = []
         self._val_uav_coords = []
@@ -373,13 +376,32 @@ class DinoSSLRetriever(pl.LightningModule):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.encode(x)
 
-    def _infonce_loss(self, q: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
-        """Symmetric InfoNCE: diagonal entries are positives."""
-        logits = (q @ k.t()) / self.temperature
-        labels = torch.arange(len(q), device=q.device)
-        loss_qk = F.cross_entropy(logits, labels)
-        loss_kq = F.cross_entropy(logits.t(), labels)
-        return 0.5 * (loss_qk + loss_kq)
+    def _vicreg_loss(self, z1: torch.Tensor, z2: torch.Tensor) -> torch.Tensor:
+        """VICReg: invariance + variance + covariance regularization."""
+        N, D = z1.shape
+
+        # Invariance: MSE between views
+        inv_loss = F.mse_loss(z1, z2)
+
+        # Variance: hinge on per-dimension std across batch, target std=1
+        z1_centered = z1 - z1.mean(0)
+        z2_centered = z2 - z2.mean(0)
+        std1 = torch.sqrt(z1_centered.var(0) + 1e-4)
+        std2 = torch.sqrt(z2_centered.var(0) + 1e-4)
+        var_loss = (F.relu(1 - std1).mean() + F.relu(1 - std2).mean()) / 2
+
+        # Covariance: off-diagonal elements of cov matrix should be zero
+        cov1 = (z1_centered.T @ z1_centered) / (N - 1)
+        cov2 = (z2_centered.T @ z2_centered) / (N - 1)
+        off_diag1 = cov1.pow(2).sum() - cov1.diagonal().pow(2).sum()
+        off_diag2 = cov2.pow(2).sum() - cov2.diagonal().pow(2).sum()
+        cov_loss = (off_diag1 + off_diag2) / D
+
+        return (
+            self.cfg.vicreg_lambda * inv_loss
+            + self.cfg.vicreg_mu * var_loss
+            + self.cfg.vicreg_nu * cov_loss
+        )
 
     def on_train_start(self):
         self._train_start_time = time.time()
@@ -389,7 +411,7 @@ class DinoSSLRetriever(pl.LightningModule):
         q = self.encode(anchor)
         k = self.encode(positive)
 
-        loss = self._infonce_loss(q, k)
+        loss = self._vicreg_loss(q, k)
 
         bs = anchor.size(0)
         self._total_samples_seen += bs
