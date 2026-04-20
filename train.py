@@ -84,7 +84,7 @@ class Config:
     image_size: int = 336
     embedding_dim: int = 768  # CLS token dim, no projection head
 
-    batch_size: int = 128
+    batch_size: int = 256
     eval_batch_size: int = 128
     num_workers: int = 8
 
