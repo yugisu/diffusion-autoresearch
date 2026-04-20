@@ -84,14 +84,14 @@ class Config:
     image_size: int = 336
     embedding_dim: int = 768  # CLS token dim, no projection head
 
-    batch_size: int = 128
+    batch_size: int = 256
     eval_batch_size: int = 128
     num_workers: int = 8
 
     lr: float = 1e-5
     weight_decay: float = 1e-4
     temperature: float = 0.07
-    warmup_epochs: int = 1
+    warmup_epochs: int = 2
 
     georank_weight: float = 0.0  # weight for GeoRank regularization (0 = disabled)
     cosine_t0: int = 0  # CosineAnnealingWarmRestarts period (0 = plain cosine decay)
@@ -103,7 +103,7 @@ class Config:
     iou_pos_threshold: float = 0.50
     iou_neg_threshold: float = 0.0  # IoU == 0 → negative
 
-    max_epochs: int = 2  # Exp9: pin to sweet spot (warmup_epochs=1, train just 1 extra epoch)
+    max_epochs: int = 13
     max_steps: int = -1
     precision: str = "16-mixed"
     seed: int = 42
