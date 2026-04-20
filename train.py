@@ -88,12 +88,13 @@ class Config:
     eval_batch_size: int = 128
     num_workers: int = 8
 
-    lr: float = 5e-6
+    lr: float = 1e-5
     weight_decay: float = 1e-4
     temperature: float = 0.07
     warmup_epochs: int = 2
 
-    georank_weight: float = 0.1  # weight for GeoRank regularization (0 = disabled)
+    georank_weight: float = 0.0  # weight for GeoRank regularization (0 = disabled)
+    cosine_t0: int = 3  # CosineAnnealingWarmRestarts period (0 = plain cosine decay)
 
     lora_rank: int = 16
     lora_alpha: float = 32.0
@@ -496,12 +497,25 @@ class DinoSSLRetriever(pl.LightningModule):
 
         warmup = self.cfg.warmup_epochs
         total = self.cfg.max_epochs
+        t0 = self.cfg.cosine_t0
 
-        def lr_lambda(epoch):
-            if epoch < warmup:
-                return (epoch + 1) / warmup
-            progress = (epoch - warmup) / max(total - warmup, 1)
-            return 0.01 + 0.99 * 0.5 * (1 + math.cos(math.pi * progress))
+        if t0 > 0:
+            # Warm restarts after linear warmup
+            def lr_lambda(epoch):
+                if epoch < warmup:
+                    return (epoch + 1) / warmup
+                e = epoch - warmup
+                cycle_len = t0
+                cycle = e // cycle_len
+                pos = e % cycle_len
+                # eta_min = 1% of max LR
+                return 0.01 + 0.99 * 0.5 * (1 + math.cos(math.pi * pos / cycle_len))
+        else:
+            def lr_lambda(epoch):
+                if epoch < warmup:
+                    return (epoch + 1) / warmup
+                progress = (epoch - warmup) / max(total - warmup, 1)
+                return 0.01 + 0.99 * 0.5 * (1 + math.cos(math.pi * progress))
 
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
         return {
@@ -534,6 +548,7 @@ def parse_args() -> Config:
     parser.add_argument("--lora-rank", type=int, default=Config.lora_rank)
     parser.add_argument("--lora-alpha", type=float, default=Config.lora_alpha)
     parser.add_argument("--georank-weight", type=float, default=Config.georank_weight)
+    parser.add_argument("--cosine-t0", type=int, default=Config.cosine_t0)
 
     parser.add_argument("--max-epochs", type=int, default=Config.max_epochs)
     parser.add_argument("--max-steps", type=int, default=Config.max_steps)
@@ -563,6 +578,7 @@ def parse_args() -> Config:
         lora_alpha=args.lora_alpha,
         lora_last_n_blocks=args.lora_last_n_blocks,
         georank_weight=args.georank_weight,
+        cosine_t0=args.cosine_t0,
         max_epochs=args.max_epochs,
         max_steps=args.max_steps,
         precision=args.precision,
