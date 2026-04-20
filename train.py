@@ -94,7 +94,7 @@ class Config:
     warmup_epochs: int = 2
 
     georank_weight: float = 0.0  # weight for GeoRank regularization (0 = disabled)
-    cosine_t0: int = 3  # CosineAnnealingWarmRestarts period (0 = plain cosine decay)
+    cosine_t0: int = 0  # CosineAnnealingWarmRestarts period (0 = plain cosine decay)
 
     lora_rank: int = 16
     lora_alpha: float = 32.0
@@ -103,7 +103,7 @@ class Config:
     iou_pos_threshold: float = 0.50
     iou_neg_threshold: float = 0.0  # IoU == 0 → negative
 
-    max_epochs: int = 20
+    max_epochs: int = 13  # reduced per Step3 (20/1.5) for larger dataset
     max_steps: int = -1
     precision: str = "16-mixed"
     seed: int = 42
@@ -202,8 +202,9 @@ def compute_iou(box_a: Tuple[float, ...], box_b: Tuple[float, ...]) -> float:
 
 class SatSSLDataset(Dataset):
     """
-    IoU-based SSL dataset: for each anchor chunk, samples a positive with IoU > threshold.
-    Higher threshold (0.5) = harder positives with less spatial ambiguity than 0.25.
+    Cross-scale SSL dataset: anchor = zoomed-in crop (25-50% of chunk area),
+    positive = full-scale view of the SAME chunk. Trains scale invariance that
+    bridges the UAV (high-res zoomed-in) ↔ satellite (lower-res full area) gap.
     """
 
     def __init__(
@@ -211,63 +212,39 @@ class SatSSLDataset(Dataset):
         root: str,
         flights: List[str],
         sat_scales: Dict[str, float],
-        transform,
-        iou_pos_threshold: float = 0.50,
+        anchor_transform,
+        positive_transform,
+        iou_pos_threshold: float = 0.50,  # kept for API compat, unused
     ):
-        self.transform = transform
-        self.iou_pos_threshold = iou_pos_threshold
-
+        self.anchor_transform = anchor_transform
+        self.positive_transform = positive_transform
         self.sat_datasets: Dict[str, SatChunkDataset] = {}
         self.samples: List[Tuple[str, int]] = []
-        self.positives: Dict[str, List[List[int]]] = {}
 
         for flight in flights:
             scale = sat_scales.get(flight, MAP_SCALE_FACTOR)
             sat_ds = SatChunkDataset(
-                root,
-                flight,
-                chunk_pixels=CHUNK_PIXELS,
-                stride_pixels=TRAIN_STRIDE,
-                scale_factor=scale,
-                transform=None,
+                root, flight, chunk_pixels=CHUNK_PIXELS,
+                stride_pixels=TRAIN_STRIDE, scale_factor=scale, transform=None,
             )
             self.sat_datasets[flight] = sat_ds
+            self.samples.extend([(flight, i) for i in range(len(sat_ds))])
 
-            bboxes = sat_ds.chunk_bboxes
-            n = len(bboxes)
-            pos_lists: List[List[int]] = [[] for _ in range(n)]
-            for i in range(n):
-                for j in range(i + 1, n):
-                    iou = compute_iou(bboxes[i], bboxes[j])
-                    if iou > iou_pos_threshold:
-                        pos_lists[i].append(j)
-                        pos_lists[j].append(i)
-
-            valid_chunks = [i for i in range(n) if len(pos_lists[i]) > 0]
-            self.positives[flight] = pos_lists
-            self.samples.extend([(flight, i) for i in valid_chunks])
-
-        print(f"SSL dataset: {len(self.samples)} anchor chunks across {len(flights)} flights (IoU>{iou_pos_threshold})")
+        print(f"SSL dataset: {len(self.samples)} chunks across {len(flights)} flights (cross-scale pairs)")
 
     def __len__(self) -> int:
         return len(self.samples)
 
     def __getitem__(self, idx: int):
-        flight, anchor_idx = self.samples[idx]
-        pos_candidates = self.positives[flight][anchor_idx]
-        pos_idx = random.choice(pos_candidates)
-
+        flight, chunk_idx = self.samples[idx]
         sat_ds = self.sat_datasets[flight]
-        anchor_img, anchor_lat, anchor_lon = sat_ds[anchor_idx]
-        pos_img, pos_lat, pos_lon = sat_ds[pos_idx]
+        img, lat, lon = sat_ds[chunk_idx]
 
-        if self.transform:
-            anchor_img = self.transform(anchor_img)
-            pos_img = self.transform(pos_img)
+        anchor = self.anchor_transform(img)    # zoomed-in view (UAV-like)
+        positive = self.positive_transform(img)  # full-scale view (satellite-like)
 
-        anchor_coords = torch.tensor([anchor_lat, anchor_lon], dtype=torch.float32)
-        pos_coords = torch.tensor([pos_lat, pos_lon], dtype=torch.float32)
-        return anchor_img, pos_img, anchor_coords, pos_coords
+        coords = torch.tensor([lat, lon], dtype=torch.float32)
+        return anchor, positive, coords, coords
 
 
 # -----------------------------------------------------------------------------
@@ -289,17 +266,23 @@ class VisLocSSLDataModule(pl.LightningDataModule):
         mean = self.processor.image_mean
         std = self.processor.image_std
 
-        self.train_transform = transforms.Compose(
-            [
-                transforms.Resize((cfg.image_size, cfg.image_size)),
-                transforms.RandomHorizontalFlip(p=0.5),
-                transforms.RandomVerticalFlip(p=0.5),
-                transforms.RandomRotation(degrees=90),
-                transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0, hue=0),
-                transforms.ToTensor(),
-                transforms.Normalize(mean=mean, std=std),
-            ]
-        )
+        aug = [
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.RandomVerticalFlip(p=0.5),
+            transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0, hue=0),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=mean, std=std),
+        ]
+        # Anchor: zoomed-in crop (25-50% of area) — simulates UAV high-res close-up
+        self.anchor_transform = transforms.Compose([
+            transforms.RandomResizedCrop(cfg.image_size, scale=(0.25, 0.50), ratio=(0.9, 1.1)),
+        ] + aug)
+        # Positive: full-scale view (75-100% of area) — simulates satellite wide view
+        self.positive_transform = transforms.Compose([
+            transforms.RandomResizedCrop(cfg.image_size, scale=(0.75, 1.00), ratio=(0.9, 1.1)),
+        ] + aug)
+        # Kept for eval (not used for training)
+        self.train_transform = self.anchor_transform
         self.eval_transform = transforms.Compose(
             [
                 transforms.Resize((cfg.image_size, cfg.image_size)),
@@ -314,7 +297,8 @@ class VisLocSSLDataModule(pl.LightningDataModule):
                 root=self.root,
                 flights=TRAIN_FLIGHTS,
                 sat_scales=SAT_SCALES,
-                transform=self.train_transform,
+                anchor_transform=self.anchor_transform,
+                positive_transform=self.positive_transform,
                 iou_pos_threshold=self.cfg.iou_pos_threshold,
             )
 
