@@ -58,7 +58,7 @@ torch.set_float32_matmul_precision("high")
 # -----------------------------------------------------------------------------
 
 DINO_MODEL = "facebook/dinov3-vitb16-pretrain-lvd1689m"
-TRAIN_FLIGHTS = ["01", "02", "04", "05", "06", "08", "09", "10", "11"]
+TRAIN_FLIGHTS = ["01", "02", "03", "04", "05", "06", "08", "09", "10", "11"]  # 03 added: learn eval region structure
 VAL_FLIGHT = "03"
 
 TRAIN_STRIDE = 64  # denser stride for SSL training (~4x more chunks)
@@ -184,8 +184,9 @@ def compute_iou(box_a: Tuple[float, ...], box_b: Tuple[float, ...]) -> float:
 
 class SatSSLDataset(Dataset):
     """
-    Self-supervised satellite chunk pairs based on IoU overlap.
-    For each anchor chunk, samples a positive (IoU > threshold) from the same flight.
+    SimCLR-style dataset: each sample returns two independently augmented views
+    of the SAME satellite chunk. Teaches augmentation invariance without positional
+    ambiguity from overlapping patches.
     """
 
     def __init__(
@@ -194,14 +195,11 @@ class SatSSLDataset(Dataset):
         flights: List[str],
         sat_scales: Dict[str, float],
         transform,
-        iou_pos_threshold: float = 0.25,
+        iou_pos_threshold: float = 0.25,  # kept for API compat, unused
     ):
         self.transform = transform
-        self.iou_pos_threshold = iou_pos_threshold
-
-        self.sat_datasets: Dict[str, SatChunkDataset] = {}
         self.samples: List[Tuple[str, int]] = []  # (flight, chunk_idx)
-        self.positives: Dict[str, List[List[int]]] = {}  # flight -> [chunk_idx -> [positive_indices]]
+        self.sat_datasets: Dict[str, SatChunkDataset] = {}
 
         for flight in flights:
             scale = sat_scales.get(flight, MAP_SCALE_FACTOR)
@@ -211,49 +209,27 @@ class SatSSLDataset(Dataset):
                 chunk_pixels=CHUNK_PIXELS,
                 stride_pixels=TRAIN_STRIDE,
                 scale_factor=scale,
-                transform=None,  # apply transform in __getitem__
+                transform=None,
             )
             self.sat_datasets[flight] = sat_ds
+            self.samples.extend([(flight, i) for i in range(len(sat_ds))])
 
-            # Precompute positive pairs based on IoU
-            bboxes = sat_ds.chunk_bboxes
-            n = len(bboxes)
-            pos_lists: List[List[int]] = [[] for _ in range(n)]
-
-            for i in range(n):
-                for j in range(i + 1, n):
-                    iou = compute_iou(bboxes[i], bboxes[j])
-                    if iou > iou_pos_threshold:
-                        pos_lists[i].append(j)
-                        pos_lists[j].append(i)
-
-            # Only keep chunks that have at least one positive
-            valid_chunks = [i for i in range(n) if len(pos_lists[i]) > 0]
-            self.positives[flight] = pos_lists
-            self.samples.extend([(flight, i) for i in valid_chunks])
-
-        print(f"SSL dataset: {len(self.samples)} anchor chunks across {len(flights)} flights (IoU>{iou_pos_threshold})")
+        print(f"SSL dataset: {len(self.samples)} chunks across {len(flights)} flights (SimCLR same-chunk pairs)")
 
     def __len__(self) -> int:
         return len(self.samples)
 
     def __getitem__(self, idx: int):
-        flight, anchor_idx = self.samples[idx]
-        pos_candidates = self.positives[flight][anchor_idx]
-        pos_idx = random.choice(pos_candidates)
-
+        flight, chunk_idx = self.samples[idx]
         sat_ds = self.sat_datasets[flight]
-        anchor_img, anchor_lat, anchor_lon = sat_ds[anchor_idx]
-        pos_img, pos_lat, pos_lon = sat_ds[pos_idx]
+        img, lat, lon = sat_ds[chunk_idx]
 
-        # Apply transforms
-        if self.transform:
-            anchor_img = self.transform(anchor_img)
-            pos_img = self.transform(pos_img)
+        # Two independent augmentations of the same chunk
+        view1 = self.transform(img) if self.transform else img
+        view2 = self.transform(img) if self.transform else img
 
-        anchor_coords = torch.tensor([anchor_lat, anchor_lon], dtype=torch.float32)
-        pos_coords = torch.tensor([pos_lat, pos_lon], dtype=torch.float32)
-        return anchor_img, pos_img, anchor_coords, pos_coords
+        coords = torch.tensor([lat, lon], dtype=torch.float32)
+        return view1, view2, coords, coords
 
 
 # -----------------------------------------------------------------------------
@@ -376,32 +352,13 @@ class DinoSSLRetriever(pl.LightningModule):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.encode(x)
 
-    def _vicreg_loss(self, z1: torch.Tensor, z2: torch.Tensor) -> torch.Tensor:
-        """VICReg: invariance + variance + covariance regularization."""
-        N, D = z1.shape
-
-        # Invariance: MSE between views
-        inv_loss = F.mse_loss(z1, z2)
-
-        # Variance: hinge on per-dimension std across batch, target std=1
-        z1_centered = z1 - z1.mean(0)
-        z2_centered = z2 - z2.mean(0)
-        std1 = torch.sqrt(z1_centered.var(0) + 1e-4)
-        std2 = torch.sqrt(z2_centered.var(0) + 1e-4)
-        var_loss = (F.relu(1 - std1).mean() + F.relu(1 - std2).mean()) / 2
-
-        # Covariance: off-diagonal elements of cov matrix should be zero
-        cov1 = (z1_centered.T @ z1_centered) / (N - 1)
-        cov2 = (z2_centered.T @ z2_centered) / (N - 1)
-        off_diag1 = cov1.pow(2).sum() - cov1.diagonal().pow(2).sum()
-        off_diag2 = cov2.pow(2).sum() - cov2.diagonal().pow(2).sum()
-        cov_loss = (off_diag1 + off_diag2) / D
-
-        return (
-            self.cfg.vicreg_lambda * inv_loss
-            + self.cfg.vicreg_mu * var_loss
-            + self.cfg.vicreg_nu * cov_loss
-        )
+    def _infonce_loss(self, q: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
+        """Symmetric InfoNCE: diagonal entries are positives."""
+        logits = (q @ k.t()) / self.cfg.temperature
+        labels = torch.arange(len(q), device=q.device)
+        loss_qk = F.cross_entropy(logits, labels)
+        loss_kq = F.cross_entropy(logits.t(), labels)
+        return 0.5 * (loss_qk + loss_kq)
 
     def on_train_start(self):
         self._train_start_time = time.time()
@@ -411,7 +368,7 @@ class DinoSSLRetriever(pl.LightningModule):
         q = self.encode(anchor)
         k = self.encode(positive)
 
-        loss = self._vicreg_loss(q, k)
+        loss = self._infonce_loss(q, k)
 
         bs = anchor.size(0)
         self._total_samples_seen += bs
