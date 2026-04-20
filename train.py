@@ -91,7 +91,7 @@ class Config:
     lr: float = 5e-6
     weight_decay: float = 1e-4
     temperature: float = 0.07
-    warmup_epochs: int = 2
+    warmup_epochs: int = 1
 
     # VICReg loss weights
     vicreg_lambda: float = 25.0  # invariance
@@ -100,7 +100,7 @@ class Config:
 
     lora_rank: int = 16
     lora_alpha: float = 32.0
-    lora_last_n_blocks: int = 4  # only last N blocks get LoRA (0=all)
+    lora_last_n_blocks: int = 2  # only last N blocks get LoRA (0=all)
 
     iou_pos_threshold: float = 0.50  # harder positives than 0.25
     iou_neg_threshold: float = 0.0  # IoU == 0 → negative
@@ -588,7 +588,7 @@ def main():
         mode="max",
         save_top_k=1,
     )
-    early_stop_cb = EarlyStopping(monitor="val/R@1", mode="max", patience=3)
+    early_stop_cb = EarlyStopping(monitor="val/R@1", mode="max", patience=5)
 
     trainer = pl.Trainer(
         accelerator="auto",
