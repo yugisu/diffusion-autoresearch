@@ -91,18 +91,15 @@ class Config:
     lr: float = 5e-6
     weight_decay: float = 1e-4
     temperature: float = 0.07
-    warmup_epochs: int = 1
+    warmup_epochs: int = 2
 
-    # VICReg loss weights
-    vicreg_lambda: float = 25.0  # invariance
-    vicreg_mu: float = 25.0      # variance
-    vicreg_nu: float = 1.0       # covariance
+    georank_weight: float = 0.1  # weight for GeoRank regularization (0 = disabled)
 
     lora_rank: int = 16
     lora_alpha: float = 32.0
-    lora_last_n_blocks: int = 2  # only last N blocks get LoRA (0=all)
+    lora_last_n_blocks: int = 4  # only last N blocks get LoRA (0=all)
 
-    iou_pos_threshold: float = 0.50  # harder positives than 0.25
+    iou_pos_threshold: float = 0.50
     iou_neg_threshold: float = 0.0  # IoU == 0 → negative
 
     max_epochs: int = 20
@@ -400,6 +397,30 @@ class DinoSSLRetriever(pl.LightningModule):
         loss_kq = F.cross_entropy(logits.t(), labels)
         return 0.5 * (loss_qk + loss_kq)
 
+    def _georank_loss(self, embs: torch.Tensor, coords: torch.Tensor) -> torch.Tensor:
+        """GeoRank: MSE between normalized geographic distance ranks and embedding similarity ranks.
+
+        Burgert et al. WACV 2025: rank-preservation regularization that ties embedding
+        space ordering to geographic ordering.
+        """
+        # Pairwise geographic distances (degrees, flat-earth approx)
+        dlat = coords[:, 0:1] - coords[:, 0:1].T
+        dlon = coords[:, 1:2] - coords[:, 1:2].T
+        geo_dist = torch.sqrt(dlat ** 2 + dlon ** 2 + 1e-10)  # (B, B)
+
+        # Pairwise cosine similarities (embs already L2-normalized)
+        sim = embs @ embs.T  # (B, B), in [-1, 1]
+
+        # Normalize both to [0, 1] for rank comparison
+        # geo: small dist → 0, large dist → 1
+        geo_norm = geo_dist / (geo_dist.max() + 1e-8)
+        # sim: large sim → 0 (close), small sim → 1 (far)
+        sim_norm = 1.0 - (sim - sim.min()) / (sim.max() - sim.min() + 1e-8)
+
+        # Exclude diagonal (self-pairs)
+        mask = ~torch.eye(embs.size(0), dtype=torch.bool, device=embs.device)
+        return F.mse_loss(sim_norm[mask], geo_norm[mask])
+
     def on_train_start(self):
         self._train_start_time = time.time()
 
@@ -408,7 +429,13 @@ class DinoSSLRetriever(pl.LightningModule):
         q = self.encode(anchor)
         k = self.encode(positive)
 
-        loss = self._infonce_loss(q, k)
+        infonce = self._infonce_loss(q, k)
+        loss = infonce
+
+        if self.cfg.georank_weight > 0:
+            gr = self._georank_loss(q, anchor_coords.to(q.device))
+            loss = infonce + self.cfg.georank_weight * gr
+            self.log("train/georank_loss", gr, on_step=True, on_epoch=False)
 
         bs = anchor.size(0)
         self._total_samples_seen += bs
@@ -506,6 +533,7 @@ def parse_args() -> Config:
 
     parser.add_argument("--lora-rank", type=int, default=Config.lora_rank)
     parser.add_argument("--lora-alpha", type=float, default=Config.lora_alpha)
+    parser.add_argument("--georank-weight", type=float, default=Config.georank_weight)
 
     parser.add_argument("--max-epochs", type=int, default=Config.max_epochs)
     parser.add_argument("--max-steps", type=int, default=Config.max_steps)
@@ -534,6 +562,7 @@ def parse_args() -> Config:
         lora_rank=args.lora_rank,
         lora_alpha=args.lora_alpha,
         lora_last_n_blocks=args.lora_last_n_blocks,
+        georank_weight=args.georank_weight,
         max_epochs=args.max_epochs,
         max_steps=args.max_steps,
         precision=args.precision,
