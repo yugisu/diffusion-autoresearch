@@ -84,7 +84,7 @@ class Config:
     image_size: int = 336
     embedding_dim: int = 768  # CLS token dim, no projection head
 
-    batch_size: int = 256
+    batch_size: int = 128
     eval_batch_size: int = 128
     num_workers: int = 8
 
@@ -275,7 +275,7 @@ class VisLocSSLDataModule(pl.LightningDataModule):
         ]
         # Anchor: zoomed-in crop (25-50% of area) — simulates UAV high-res close-up
         self.anchor_transform = transforms.Compose([
-            transforms.RandomResizedCrop(cfg.image_size, scale=(0.25, 0.50), ratio=(0.9, 1.1)),
+            transforms.RandomResizedCrop(cfg.image_size, scale=(0.10, 0.25), ratio=(0.9, 1.1)),
         ] + aug)
         # Positive: full-scale view (75-100% of area) — simulates satellite wide view
         self.positive_transform = transforms.Compose([
