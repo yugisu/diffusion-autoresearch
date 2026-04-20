@@ -100,8 +100,9 @@ class Config:
 
     lora_rank: int = 16
     lora_alpha: float = 32.0
+    lora_last_n_blocks: int = 4  # only last N blocks get LoRA (0=all)
 
-    iou_pos_threshold: float = 0.25
+    iou_pos_threshold: float = 0.50  # harder positives than 0.25
     iou_neg_threshold: float = 0.0  # IoU == 0 → negative
 
     max_epochs: int = 20
@@ -144,19 +145,38 @@ class LoRALinear(nn.Module):
         return base + lora
 
 
-def apply_lora(model: nn.Module, rank: int = 16, alpha: float = 32.0) -> nn.Module:
-    """Apply LoRA to all qkv projection layers in the ViT backbone."""
+def apply_lora(model: nn.Module, rank: int = 16, alpha: float = 32.0, last_n_blocks: int = 0) -> nn.Module:
+    """Apply LoRA to qkv projection layers in the ViT backbone.
+
+    last_n_blocks: if >0, only apply LoRA to the last N transformer blocks (0 = all blocks).
+    """
     for name, module in model.named_modules():
-        if isinstance(module, nn.Linear) and any(
+        if not (isinstance(module, nn.Linear) and any(
             k in name for k in ("query", "key", "value", "qkv", "q_proj", "k_proj", "v_proj")
-        ):
-            parent_name = ".".join(name.split(".")[:-1])
-            attr_name = name.split(".")[-1]
-            parent = model
-            for part in parent_name.split("."):
-                if part:
-                    parent = getattr(parent, part)
-            setattr(parent, attr_name, LoRALinear(getattr(parent, attr_name), rank, alpha))
+        )):
+            continue
+
+        if last_n_blocks > 0:
+            # Extract block index from name (e.g. "encoder.layer.10.attention...")
+            parts = name.split(".")
+            block_indices = [int(p) for p in parts if p.isdigit()]
+            if not block_indices:
+                continue
+            block_idx = block_indices[0]
+            # Count total blocks to determine cutoff
+            total_blocks = sum(1 for n, _ in model.named_modules() if n.endswith(".layernorm_before") or n.endswith(".layer_norm1"))
+            if total_blocks == 0:
+                total_blocks = 12  # ViT-B default
+            if block_idx < total_blocks - last_n_blocks:
+                continue
+
+        parent_name = ".".join(name.split(".")[:-1])
+        attr_name = name.split(".")[-1]
+        parent = model
+        for part in parent_name.split("."):
+            if part:
+                parent = getattr(parent, part)
+        setattr(parent, attr_name, LoRALinear(getattr(parent, attr_name), rank, alpha))
     return model
 
 
@@ -184,9 +204,8 @@ def compute_iou(box_a: Tuple[float, ...], box_b: Tuple[float, ...]) -> float:
 
 class SatSSLDataset(Dataset):
     """
-    SimCLR-style dataset: each sample returns two independently augmented views
-    of the SAME satellite chunk. Teaches augmentation invariance without positional
-    ambiguity from overlapping patches.
+    IoU-based SSL dataset: for each anchor chunk, samples a positive with IoU > threshold.
+    Higher threshold (0.5) = harder positives with less spatial ambiguity than 0.25.
     """
 
     def __init__(
@@ -195,11 +214,14 @@ class SatSSLDataset(Dataset):
         flights: List[str],
         sat_scales: Dict[str, float],
         transform,
-        iou_pos_threshold: float = 0.25,  # kept for API compat, unused
+        iou_pos_threshold: float = 0.50,
     ):
         self.transform = transform
-        self.samples: List[Tuple[str, int]] = []  # (flight, chunk_idx)
+        self.iou_pos_threshold = iou_pos_threshold
+
         self.sat_datasets: Dict[str, SatChunkDataset] = {}
+        self.samples: List[Tuple[str, int]] = []
+        self.positives: Dict[str, List[List[int]]] = {}
 
         for flight in flights:
             scale = sat_scales.get(flight, MAP_SCALE_FACTOR)
@@ -212,24 +234,42 @@ class SatSSLDataset(Dataset):
                 transform=None,
             )
             self.sat_datasets[flight] = sat_ds
-            self.samples.extend([(flight, i) for i in range(len(sat_ds))])
 
-        print(f"SSL dataset: {len(self.samples)} chunks across {len(flights)} flights (SimCLR same-chunk pairs)")
+            bboxes = sat_ds.chunk_bboxes
+            n = len(bboxes)
+            pos_lists: List[List[int]] = [[] for _ in range(n)]
+            for i in range(n):
+                for j in range(i + 1, n):
+                    iou = compute_iou(bboxes[i], bboxes[j])
+                    if iou > iou_pos_threshold:
+                        pos_lists[i].append(j)
+                        pos_lists[j].append(i)
+
+            valid_chunks = [i for i in range(n) if len(pos_lists[i]) > 0]
+            self.positives[flight] = pos_lists
+            self.samples.extend([(flight, i) for i in valid_chunks])
+
+        print(f"SSL dataset: {len(self.samples)} anchor chunks across {len(flights)} flights (IoU>{iou_pos_threshold})")
 
     def __len__(self) -> int:
         return len(self.samples)
 
     def __getitem__(self, idx: int):
-        flight, chunk_idx = self.samples[idx]
+        flight, anchor_idx = self.samples[idx]
+        pos_candidates = self.positives[flight][anchor_idx]
+        pos_idx = random.choice(pos_candidates)
+
         sat_ds = self.sat_datasets[flight]
-        img, lat, lon = sat_ds[chunk_idx]
+        anchor_img, anchor_lat, anchor_lon = sat_ds[anchor_idx]
+        pos_img, pos_lat, pos_lon = sat_ds[pos_idx]
 
-        # Two independent augmentations of the same chunk
-        view1 = self.transform(img) if self.transform else img
-        view2 = self.transform(img) if self.transform else img
+        if self.transform:
+            anchor_img = self.transform(anchor_img)
+            pos_img = self.transform(pos_img)
 
-        coords = torch.tensor([lat, lon], dtype=torch.float32)
-        return view1, view2, coords, coords
+        anchor_coords = torch.tensor([anchor_lat, anchor_lon], dtype=torch.float32)
+        pos_coords = torch.tensor([pos_lat, pos_lon], dtype=torch.float32)
+        return anchor_img, pos_img, anchor_coords, pos_coords
 
 
 # -----------------------------------------------------------------------------
@@ -335,7 +375,7 @@ class DinoSSLRetriever(pl.LightningModule):
         # Freeze backbone, then apply LoRA
         for param in self.backbone.parameters():
             param.requires_grad = False
-        self.backbone = apply_lora(self.backbone, rank=cfg.lora_rank, alpha=cfg.lora_alpha)
+        self.backbone = apply_lora(self.backbone, rank=cfg.lora_rank, alpha=cfg.lora_alpha, last_n_blocks=cfg.lora_last_n_blocks)
 
         self._val_uav_embs = []
         self._val_sat_embs = []
@@ -473,6 +513,8 @@ def parse_args() -> Config:
     parser.add_argument("--seed", type=int, default=Config.seed)
 
     parser.add_argument("--warmup-epochs", type=int, default=Config.warmup_epochs)
+    parser.add_argument("--lora-last-n-blocks", type=int, default=Config.lora_last_n_blocks)
+    parser.add_argument("--iou-pos-threshold", type=float, default=Config.iou_pos_threshold)
     parser.add_argument("--wandb-project", type=str, default=Config.wandb_project)
     parser.add_argument("--wandb-run-name", type=str, default=None)
     parser.add_argument("--model-name", type=str, default=DINO_MODEL)
@@ -491,11 +533,13 @@ def parse_args() -> Config:
         temperature=args.temperature,
         lora_rank=args.lora_rank,
         lora_alpha=args.lora_alpha,
+        lora_last_n_blocks=args.lora_last_n_blocks,
         max_epochs=args.max_epochs,
         max_steps=args.max_steps,
         precision=args.precision,
         seed=args.seed,
         warmup_epochs=args.warmup_epochs,
+        iou_pos_threshold=args.iou_pos_threshold,
         wandb_project=args.wandb_project,
         wandb_run_name=args.wandb_run_name,
     )
