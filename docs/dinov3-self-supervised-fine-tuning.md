@@ -90,7 +90,7 @@ Val flight: 03
 | 11 | 93a0e29 | 0.4740 | 0.6276 | 0.6914 | discard | Anchor scale=10-25% (wider gap) — too hard, degrades ep0→ep1 |
 | 12 | 5c99fa2 | 0.5091 | 0.6471 | 0.7057 | discard | Projection head 768→256 — same peak/degradation, does not shield backbone |
 | 13 | e656447 | **0.5299** | 0.6641 | 0.7057 | keep | **Asymmetric augmentation** — strong color+blur+grayscale on anchor; 5 epochs of improvement, peak epoch 5 |
-| 14 | bfe91c2 | TBD | — | — | TBD | Exp13 augmentation + batch=256 |
+| 14 | bfe91c2 | 0.5260 | 0.6484 | 0.6940 | discard | Exp13 augmentation + batch=256 — peak 0.5260 at epoch 3, degraded epoch 4; combined task too hard |
 
 ---
 
@@ -108,9 +108,9 @@ Experiments 8–12 all peaked at ~0.5091 and degraded within 1–2 full-LR epoch
 
 Every experiment without strong augmentation showed the same pattern: a peak at the warmup-to-full-LR transition (~1300 gradient steps, ~164k samples seen), followed by monotonic degradation. The pretrained DINO features that support cross-domain transfer are progressively overwritten as LoRA adapts attention patterns to satellite-specific textures. Stronger augmentation on the anchor slows this process by making the SSL task harder and more representative of the target domain, giving the backbone more stable gradient signal.
 
-### 4. Batch size improves stability but not the peak (alone)
+### 4. Batch size improves stability but not the peak
 
-Batch=256 (Exp10) held the 0.5091 peak for 2 epochs vs immediate drop with batch=128 — a stability improvement but no ceiling increase. Once the peak was raised by asymmetric augmentation (Exp13), Exp14 tests whether combining both stability improvements can push further.
+Batch=256 (Exp10) held the 0.5091 peak for 2 epochs vs immediate drop with batch=128 — a stability improvement but no ceiling increase. Combining batch=256 with Exp13's asymmetric augmentation (Exp14) actually hurt: the combined task difficulty (harder negatives + stronger augmentation) was too high, peaking at 0.5260 vs Exp13's 0.5299 and degrading a full epoch earlier. The optimal balance is batch=128 with strong augmentation.
 
 ### 5. Satellite TTA is free performance
 
@@ -127,6 +127,7 @@ Averaging satellite gallery embeddings over 4 rotations (0°/90°/180°/270°) a
 | Wider cross-scale gap (anchor=10-25%) | Task too hard: model cannot learn useful scale invariance in ~1300 steps at this difficulty level |
 | Projection head (768→256) | Does not shield the CLS token from SSL pressure — same peak, same degradation rate |
 | LoRA on last 2 blocks only | Less capacity meant peak epoch arrived faster and degradation was steeper |
+| batch=256 + strong augmentation | Combined task difficulty overshoots: peak 0.5260 vs 0.5299 at batch=128, degraded a full epoch earlier |
 
 ---
 
