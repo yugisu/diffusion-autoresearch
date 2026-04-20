@@ -92,6 +92,7 @@ class Config:
     weight_decay: float = 1e-4
     temperature: float = 0.07
     warmup_epochs: int = 2
+    proj_dim: int = 256  # projection head output dim (0 = disabled, use raw CLS for SSL)
 
     georank_weight: float = 0.0  # weight for GeoRank regularization (0 = disabled)
     cosine_t0: int = 0  # CosineAnnealingWarmRestarts period (0 = plain cosine decay)
@@ -275,7 +276,7 @@ class VisLocSSLDataModule(pl.LightningDataModule):
         ]
         # Anchor: zoomed-in crop (25-50% of area) — simulates UAV high-res close-up
         self.anchor_transform = transforms.Compose([
-            transforms.RandomResizedCrop(cfg.image_size, scale=(0.10, 0.25), ratio=(0.9, 1.1)),
+            transforms.RandomResizedCrop(cfg.image_size, scale=(0.25, 0.50), ratio=(0.9, 1.1)),
         ] + aug)
         # Positive: full-scale view (75-100% of area) — simulates satellite wide view
         self.positive_transform = transforms.Compose([
@@ -342,6 +343,27 @@ class VisLocSSLDataModule(pl.LightningDataModule):
 
 
 # -----------------------------------------------------------------------------
+# Projection head
+# -----------------------------------------------------------------------------
+
+
+class ProjectionHead(nn.Module):
+    """2-layer MLP projection head used only during SSL training (discarded at eval)."""
+
+    def __init__(self, in_dim: int, out_dim: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, in_dim),
+            nn.BatchNorm1d(in_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(in_dim, out_dim),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return F.normalize(self.net(x), dim=-1)
+
+
+# -----------------------------------------------------------------------------
 # Lightning model
 # -----------------------------------------------------------------------------
 
@@ -358,6 +380,11 @@ class DinoSSLRetriever(pl.LightningModule):
         for param in self.backbone.parameters():
             param.requires_grad = False
         self.backbone = apply_lora(self.backbone, rank=cfg.lora_rank, alpha=cfg.lora_alpha, last_n_blocks=cfg.lora_last_n_blocks)
+
+        if cfg.proj_dim > 0:
+            self.proj_head = ProjectionHead(cfg.embedding_dim, cfg.proj_dim)
+        else:
+            self.proj_head = None
 
         self._val_uav_embs = []
         self._val_sat_embs = []
@@ -414,7 +441,14 @@ class DinoSSLRetriever(pl.LightningModule):
         q = self.encode(anchor)
         k = self.encode(positive)
 
-        infonce = self._infonce_loss(q, k)
+        # Use projection head for SSL loss if enabled (backbone CLS used raw at eval)
+        if self.proj_head is not None:
+            q_ssl = self.proj_head(q)
+            k_ssl = self.proj_head(k)
+        else:
+            q_ssl, k_ssl = q, k
+
+        infonce = self._infonce_loss(q_ssl, k_ssl)
         loss = infonce
 
         if self.cfg.georank_weight > 0:
