@@ -31,7 +31,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torchsort
 import torchvision.transforms.functional as TF
 from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint
 from lightning.pytorch.loggers import WandbLogger
@@ -337,9 +336,15 @@ def georank_loss(
     emb_dist = emb_dist.masked_fill(eye, inf)
     geo_dist = geo_dist.masked_fill(eye, inf)
 
-    # torchsort.soft_rank operates on the last dim of a 2D tensor → (N, N) works directly
-    e_ranks = torchsort.soft_rank(emb_dist, regularization_strength=regularization_strength)
-    g_ranks = torchsort.soft_rank(geo_dist, regularization_strength=regularization_strength)
+    # Differentiable soft rank: rank(x)[i] = 1 + Σⱼ σ((x[i]-x[j]) / strength)
+    # Applied per-row: diff[i,j,k] = x[i,j] - x[i,k], sum over k → rank of each j within row i
+    # Previous version: torchsort's soft_rank fn; didn't work because it doesn't support torch 2.3
+    def _soft_rank(x: torch.Tensor) -> torch.Tensor:
+        diff = x.unsqueeze(-1) - x.unsqueeze(-2)
+        return 1.0 + torch.sigmoid(diff * regularization_strength).sum(-1)
+
+    e_ranks = _soft_rank(emb_dist)
+    g_ranks = _soft_rank(geo_dist)
 
     # Normalize to [0, 1]
     e_ranks = e_ranks / N

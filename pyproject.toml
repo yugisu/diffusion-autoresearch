@@ -18,7 +18,6 @@ dependencies = [
     "accelerate==0.34.2",
     "lightning>=2.2.0",
     "wandb>=0.17.0",
-    "torchsort>=0.1.10",
 ]
 
 [tool.uv.sources]
