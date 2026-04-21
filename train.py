@@ -3,8 +3,6 @@ Self-supervised DINOv3 training for VisLoc cross-view retrieval.
 
 Branch goal:
 - Fine-tune facebook/dinov3-vitb16-pretrain-lvd1689m with self-supervised learning
-- Train on satellite chunks only from flights: 01, 02, 04, 05, 06, 08, 09, 10, 11
-- Validate on flight: 03 (768 UAV queries, 2860 satellite chunks)
 - Optimize for Recall@1 on fixed VisLoc evaluation
 - No UAV images during training — satellite chunks only
 
@@ -32,7 +30,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.transforms.functional as TF
-from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint
+from lightning.pytorch.callbacks import EarlyStopping, LearningRateMonitor, ModelCheckpoint
 from lightning.pytorch.loggers import WandbLogger
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts, LinearLR, SequentialLR
@@ -60,7 +58,7 @@ TRAIN_FLIGHTS = ["01", "02", "03", "04", "05", "06", "08", "09", "10", "11"]  # 
 
 CHUNK_PIXELS = 512
 CHUNK_STRIDE = 128
-TRAIN_STRIDE = 64  # Produce more chunks for training.
+TRAIN_STRIDE = 128  # Produce more chunks for training.
 
 SAT_SCALES = {
     "01": 0.25,
@@ -94,20 +92,22 @@ class Config:
     weight_decay: float = 1e-4
     warmup_epochs: int = 2
     max_epochs: int = 13
+    gradient_clip_val: float = 1.0
 
     contrastive_temperature: float = 0.07  # contrastive temperature
     georank_weight: float = 0.0  # weight for GeoRank regularization (0 = disabled)
-    georank_temperature: float = 1.0  # temperature for GeoRank regularization - smaller -> hard ranks, larger -> less meaningful ranks
+    georank_temperature: float = (
+        1.0  # sigmoid slope inside the soft rank - larger -> harder/sharper ranks (less gradient), smaller -> softer ranks
+    )
 
     cosine_t0: int = 0  # CosineAnnealingWarmRestarts period (0 = single cycle = plain cosine)
-    llrd_decay: float = 0.8  # per-block LR decay: block[n-1] gets lr*decay, block[n-2] gets lr*decay^2, ...
+    llrd_decay: float = 0.6  # per-block LR decay: block[n-1] gets lr*decay, block[n-2] gets lr*decay^2, ...
 
-    wandb_project: str = "autoresearch-ssl-dinov3"
+    wandb_project: str = "ssl-dinov3"
     wandb_run_name: str | None = None
 
-    # Unused for now.
-    iou_pos_threshold: float = 0.50
-    iou_neg_threshold: float = 0.0  # IoU == 0 → negative
+    iou_pos_threshold: float = 0.50  # unused
+    iou_neg_threshold: float = 0.0  # off-diagonal pairs with IoU > this are masked out of InfoNCE negatives (0 = mask any overlap)
 
 
 # -----------------------------------------------------------------------------
@@ -139,6 +139,18 @@ def compute_iou(box_a: Tuple[float, ...], box_b: Tuple[float, ...]) -> float:
     area_b = (box_b[2] - box_b[0]) * (box_b[3] - box_b[1])
     union = area_a + area_b - inter
     return inter / union if union > 0 else 0.0
+
+
+def batched_iou(boxes: torch.Tensor) -> torch.Tensor:
+    """Pairwise IoU for a batch of (lat_min, lon_min, lat_max, lon_max) bboxes.
+    Returns (N, N) float tensor in [0, 1]."""
+    lat_min, lon_min, lat_max, lon_max = boxes.unbind(dim=-1)
+    inter_lat = (torch.minimum(lat_max[:, None], lat_max[None, :]) - torch.maximum(lat_min[:, None], lat_min[None, :])).clamp(min=0)
+    inter_lon = (torch.minimum(lon_max[:, None], lon_max[None, :]) - torch.maximum(lon_min[:, None], lon_min[None, :])).clamp(min=0)
+    inter = inter_lat * inter_lon
+    area = (lat_max - lat_min) * (lon_max - lon_min)
+    union = area[:, None] + area[None, :] - inter
+    return torch.where(union > 0, inter / union, torch.zeros_like(inter))
 
 
 # -----------------------------------------------------------------------------
@@ -194,7 +206,8 @@ class SatSSLDataset(Dataset):
         positive = self.positive_transform(img)  # full-scale view (satellite-like)
 
         coords = torch.tensor([lat, lon], dtype=torch.float32)
-        return anchor, positive, coords, coords
+        bbox = torch.tensor(sat_ds.chunk_bboxes[chunk_idx], dtype=torch.float32)
+        return anchor, positive, coords, coords, bbox
 
 
 # -----------------------------------------------------------------------------
@@ -223,18 +236,18 @@ class VisLocSSLDataModule(pl.LightningDataModule):
             transforms.Normalize(mean=mean, std=std),
         ]
         # Anchor: zoomed-in UAV-like crop + stronger sensor/temporal augmentation
-        self.anchor_transform = [
+        self.anchor_transform = transforms.Compose([
             # non-aggressive zoom-in because SAT_SCALES are designed that way to roughly match UAV viewpoints.
             transforms.RandomResizedCrop(cfg.image_size, scale=(0.5, 0.75), ratio=(0.9, 1.1)),
             transforms.ColorJitter(brightness=0.5, contrast=0.5, saturation=0.1, hue=0),
             *shared_aug,
-        ]
+        ])
         # Positive: full-scale satellite view — mild augmentation only
-        self.positive_transform = [
+        self.positive_transform = transforms.Compose([
             transforms.RandomResizedCrop(cfg.image_size, scale=(0.75, 1.00), ratio=(0.9, 1.1)),
             transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0, hue=0),
             *shared_aug,
-        ]
+        ])
 
         # Kept for eval (not used for training)
         self.train_transform = self.anchor_transform
@@ -299,9 +312,18 @@ class VisLocSSLDataModule(pl.LightningDataModule):
 # -----------------------------------------------------------------------------
 
 
-def symnce_loss(q: torch.Tensor, k: torch.Tensor, temperature: float) -> torch.Tensor:
-    """Symmetric InfoNCE: diagonal entries are positives."""
+def symnce_loss(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    temperature: float,
+    negative_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Symmetric InfoNCE: diagonal entries are positives. If ``negative_mask``
+    is provided (bool, (N, N)), True entries are excluded from the softmax
+    denominator in both directions. The diagonal must be False."""
     logits = (q @ k.t()) / temperature
+    if negative_mask is not None:
+        logits = logits.masked_fill(negative_mask, float("-inf"))
     labels = torch.arange(len(q), device=q.device)
     loss_qk = F.cross_entropy(logits, labels)
     loss_kq = F.cross_entropy(logits.t(), labels)
@@ -389,14 +411,21 @@ class DinoSSLRetrieverSt1(pl.LightningModule):
         self._train_start_time = time.time()
 
     def training_step(self, batch, batch_idx):
-        anchor, positive, anchor_coords, pos_coords = batch
+        anchor, positive, anchor_coords, pos_coords, bboxes = batch
 
         q = self.encode(anchor)
         k = self.encode(positive)
 
         q_ssl, k_ssl = q, k
 
-        symnce = symnce_loss(q_ssl, k_ssl, self.cfg.contrastive_temperature)
+        # Don't treat spatially-overlapping chunks as negatives: with stride=128
+        # and chunk=512, neighbouring chunks overlap ~75% and are near-duplicates.
+        iou = batched_iou(bboxes)
+        eye = torch.eye(bboxes.size(0), dtype=torch.bool, device=iou.device)
+        negative_mask = (iou > self.cfg.iou_neg_threshold) & ~eye
+        self.log("train/masked_neg_frac", negative_mask.float().mean(), on_step=True, on_epoch=False)
+
+        symnce = symnce_loss(q_ssl, k_ssl, self.cfg.contrastive_temperature, negative_mask=negative_mask)
         self.log("train/symnce_loss", symnce, on_step=True, on_epoch=False)
 
         if self.cfg.georank_weight > 0:
@@ -462,11 +491,11 @@ class DinoSSLRetrieverSt1(pl.LightningModule):
 
     def configure_optimizers(self):
         # LLRD (per blocks)
-        early_params = [p for blk in self.backbone.encoder.layer[:4] for p in blk.parameters()]
+        early_params = [p for blk in self.backbone.layer[:4] for p in blk.parameters()]
         early_params += list(self.backbone.embeddings.parameters())
-        mid_params = [p for blk in self.backbone.encoder.layer[4:8] for p in blk.parameters()]
-        late_params = [p for blk in self.backbone.encoder.layer[8:] for p in blk.parameters()]
-        late_params += list(self.backbone.layernorm.parameters())
+        mid_params = [p for blk in self.backbone.layer[4:8] for p in blk.parameters()]
+        late_params = [p for blk in self.backbone.layer[8:] for p in blk.parameters()]
+        late_params += list(self.backbone.norm.parameters())
 
         param_groups = [
             {"params": early_params, "lr": self.cfg.lr * self.cfg.llrd_decay**2, "name": "early"},  # decay^2
@@ -513,6 +542,7 @@ def parse_args() -> Config:
 
     parser.add_argument("--lr", type=float, default=Config.lr)
     parser.add_argument("--weight-decay", type=float, default=Config.weight_decay)
+    parser.add_argument("--gradient-clip-val", type=float, default=Config.gradient_clip_val)
 
     parser.add_argument("--contrastive-temperature", type=float, default=Config.contrastive_temperature)
     parser.add_argument("--georank-weight", type=float, default=Config.georank_weight)
@@ -542,6 +572,7 @@ def parse_args() -> Config:
         eval_batch_size=args.eval_batch_size,
         num_workers=args.num_workers,
         lr=args.lr,
+        gradient_clip_val=args.gradient_clip_val,
         weight_decay=args.weight_decay,
         contrastive_temperature=args.contrastive_temperature,
         georank_weight=args.georank_weight,
@@ -600,6 +631,7 @@ def main():
         monitor="val/R@1",
         mode="max",
         save_top_k=1,
+        filename="best-{epoch:02d}-R@1={val/R@1:.4f}",
     )
     early_stop_cb = EarlyStopping(monitor="val/R@1", mode="max", patience=5)
 
@@ -609,9 +641,10 @@ def main():
         max_epochs=cfg.max_epochs,
         precision=cfg.precision,
         logger=wandb_logger,
-        callbacks=[ckpt_cb, early_stop_cb],
+        callbacks=[ckpt_cb, early_stop_cb, LearningRateMonitor(logging_interval="step")],
         log_every_n_steps=5,
         benchmark=True,
+        gradient_clip_val=cfg.gradient_clip_val,
     )
 
     trainer.fit(model, datamodule=datamodule)
