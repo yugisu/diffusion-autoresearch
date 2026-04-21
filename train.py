@@ -41,9 +41,6 @@ from torchvision import transforms
 from transformers import AutoImageProcessor, AutoModel
 
 from prepare import (
-    CHUNK_PIXELS,
-    CHUNK_STRIDE,
-    MAP_SCALE_FACTOR,
     VISLOC_ROOT,
     SatChunkDataset,
     UAVDataset,
@@ -58,10 +55,12 @@ torch.set_float32_matmul_precision("high")
 # -----------------------------------------------------------------------------
 
 DINO_MODEL = "facebook/dinov3-vitb16-pretrain-lvd1689m"
-TRAIN_FLIGHTS = ["01", "02", "03", "04", "05", "06", "08", "09", "10", "11"]  # 03 added: learn eval region structure
 VAL_FLIGHT = "03"
+TRAIN_FLIGHTS = ["01", "02", "03", "04", "05", "06", "08", "09", "10", "11"]  # val flight included: learn eval region structure
 
-TRAIN_STRIDE = 64  # denser stride for SSL training (~4x more chunks)
+CHUNK_PIXELS = 512
+CHUNK_STRIDE = 128
+TRAIN_STRIDE = 64 # Produce more chunks for training.
 
 SAT_SCALES = {
     "01": 0.25,
@@ -150,9 +149,7 @@ def apply_lora(model: nn.Module, rank: int = 16, alpha: float = 32.0, last_n_blo
     last_n_blocks: if >0, only apply LoRA to the last N transformer blocks (0 = all blocks).
     """
     for name, module in model.named_modules():
-        if not (isinstance(module, nn.Linear) and any(
-            k in name for k in ("query", "key", "value", "qkv", "q_proj", "k_proj", "v_proj")
-        )):
+        if not (isinstance(module, nn.Linear) and any(k in name for k in ("query", "key", "value", "qkv", "q_proj", "k_proj", "v_proj"))):
             continue
 
         if last_n_blocks > 0:
@@ -223,10 +220,14 @@ class SatSSLDataset(Dataset):
         self.samples: List[Tuple[str, int]] = []
 
         for flight in flights:
-            scale = sat_scales.get(flight, MAP_SCALE_FACTOR)
+            scale = sat_scales[flight]
             sat_ds = SatChunkDataset(
-                root, flight, chunk_pixels=CHUNK_PIXELS,
-                stride_pixels=TRAIN_STRIDE, scale_factor=scale, transform=None,
+                root,
+                flight,
+                chunk_pixels=CHUNK_PIXELS,
+                stride_pixels=TRAIN_STRIDE,
+                scale_factor=scale,
+                transform=None,
             )
             self.sat_datasets[flight] = sat_ds
             self.samples.extend([(flight, i) for i in range(len(sat_ds))])
@@ -241,7 +242,7 @@ class SatSSLDataset(Dataset):
         sat_ds = self.sat_datasets[flight]
         img, lat, lon = sat_ds[chunk_idx]
 
-        anchor = self.anchor_transform(img)    # zoomed-in view (UAV-like)
+        anchor = self.anchor_transform(img)  # zoomed-in view (UAV-like)
         positive = self.positive_transform(img)  # full-scale view (satellite-like)
 
         coords = torch.tensor([lat, lon], dtype=torch.float32)
@@ -282,19 +283,20 @@ class VisLocSSLDataModule(pl.LightningDataModule):
         ]
         self.anchor_transform = transforms.Compose(anchor_aug + shared_aug)
         # Positive: full-scale satellite view — mild augmentation only
-        self.positive_transform = transforms.Compose([
-            transforms.RandomResizedCrop(cfg.image_size, scale=(0.75, 1.00), ratio=(0.9, 1.1)),
-            transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0, hue=0),
-        ] + shared_aug)
+        self.positive_transform = transforms.Compose(
+            [
+                transforms.RandomResizedCrop(cfg.image_size, scale=(0.75, 1.00), ratio=(0.9, 1.1)),
+                transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0, hue=0),
+            ]
+            + shared_aug
+        )
         # Kept for eval (not used for training)
         self.train_transform = self.anchor_transform
-        self.eval_transform = transforms.Compose(
-            [
-                transforms.Resize((cfg.image_size, cfg.image_size)),
-                transforms.ToTensor(),
-                transforms.Normalize(mean=mean, std=std),
-            ]
-        )
+        self.eval_transform = transforms.Compose([
+            transforms.Resize((cfg.image_size, cfg.image_size)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=mean, std=std),
+        ])
 
     def setup(self, stage: str | None = None):
         if self.train_ds is None:
@@ -308,7 +310,7 @@ class VisLocSSLDataModule(pl.LightningDataModule):
             )
 
         if self.val_uav_ds is None or self.val_sat_ds is None:
-            val_scale = SAT_SCALES.get(VAL_FLIGHT, MAP_SCALE_FACTOR)
+            val_scale = SAT_SCALES[VAL_FLIGHT]
             self.val_uav_ds = UAVDataset(self.root, VAL_FLIGHT, transform=self.eval_transform)
             self.val_sat_ds = SatChunkDataset(
                 self.root,
@@ -422,7 +424,7 @@ class DinoSSLRetriever(pl.LightningModule):
         # Pairwise geographic distances (degrees, flat-earth approx)
         dlat = coords[:, 0:1] - coords[:, 0:1].T
         dlon = coords[:, 1:2] - coords[:, 1:2].T
-        geo_dist = torch.sqrt(dlat ** 2 + dlon ** 2 + 1e-10)  # (B, B)
+        geo_dist = torch.sqrt(dlat**2 + dlon**2 + 1e-10)  # (B, B)
 
         # Pairwise cosine similarities (embs already L2-normalized)
         sim = embs @ embs.T  # (B, B), in [-1, 1]
@@ -532,7 +534,9 @@ class DinoSSLRetriever(pl.LightningModule):
                 pos = e % cycle_len
                 # eta_min = 1% of max LR
                 return 0.01 + 0.99 * 0.5 * (1 + math.cos(math.pi * pos / cycle_len))
+
         else:
+
             def lr_lambda(epoch):
                 if epoch < warmup:
                     return (epoch + 1) / warmup
@@ -641,7 +645,7 @@ def main():
     # Count trainable params
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total = sum(p.numel() for p in model.parameters())
-    print(f"Trainable params: {trainable:,} / {total:,} ({100*trainable/total:.2f}%)")
+    print(f"Trainable params: {trainable:,} / {total:,} ({100 * trainable / total:.2f}%)")
 
     wandb_logger = WandbLogger(
         project=cfg.wandb_project,

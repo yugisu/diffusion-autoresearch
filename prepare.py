@@ -5,23 +5,19 @@ Provides dataset classes and the Recall@1/5/10 evaluation. DO NOT MODIFY.
 Usage (one-time sanity check): uv run prepare.py
 """
 
+from visloc import UAVDataset, SatChunkDataset
+
 import os
 from pathlib import Path
 
 import numpy as np
-import pandas as pd
-import rasterio
-from PIL import Image
-from rasterio.enums import Resampling
-from rasterio.merge import merge as rasterio_merge
-from torch.utils.data import Dataset
 
 # ---------------------------------------------------------------------------
 # Constants (fixed — do not modify)
 # ---------------------------------------------------------------------------
 
 VISLOC_ROOT = Path("/workspace/data/visloc")
-HF_HOME = "/workspace/.hugging_face"
+os.environ["HF_HOME"] = "/workspace/.hugging_face"
 FLIGHT_ID = "03"
 TIME_BUDGET = 2700  # seconds (45 minutes wall-clock budget per experiment)
 
@@ -31,129 +27,16 @@ CHUNK_PIXELS = 512
 CHUNK_STRIDE = 128
 MAP_SCALE_FACTOR = 0.25
 
-os.environ["HF_HOME"] = HF_HOME
-
-# ---------------------------------------------------------------------------
-# Dataset classes
-# ---------------------------------------------------------------------------
-
-def _read_sat_bounds(root: Path, flight_id: str) -> tuple[float, float, float, float]:
-    """Returns (lat_min, lon_min, lat_max, lon_max) from the VisLoc coordinates CSV."""
-    df = pd.read_csv(root / "satellite_coordinates_range.csv")
-    row = df[df["mapname"].isin([f"satellite{flight_id}.tif", f"{flight_id}.tif"])].iloc[0]
-    return (
-        float(row["RB_lat_map"]),  # lat_min  (RB = right-bottom corner)
-        float(row["LT_lon_map"]),  # lon_min  (LT = left-top corner)
-        float(row["LT_lat_map"]),  # lat_max
-        float(row["RB_lon_map"]),  # lon_max
-    )
-
-
-class UAVDataset(Dataset):
-    """VisLoc UAV drone images. Used as the query set — never for training."""
-
-    def __init__(self, root: Path, flight_id: str, transform=None):
-        self.drone_dir = root / flight_id / "drone"
-        self.transform = transform
-        df = pd.read_csv(root / flight_id / f"{flight_id}.csv")
-        self.records = df[["filename", "lat", "lon"]].reset_index(drop=True)
-
-    def __len__(self) -> int:
-        return len(self.records)
-
-    def __getitem__(self, idx: int):
-        row = self.records.iloc[idx]
-        img = Image.open(self.drone_dir / row["filename"]).convert("RGB")
-        if self.transform is not None:
-            img = self.transform(img)
-        return img, float(row["lat"]), float(row["lon"])
-
-
-class SatChunkDataset(Dataset):
-    """Fixed, evenly-tiled satellite chunks. The retrieval gallery."""
-
-    def __init__(
-        self,
-        root: Path,
-        flight_id: str,
-        chunk_pixels: int = CHUNK_PIXELS,
-        stride_pixels: int = CHUNK_STRIDE,
-        scale_factor: float = MAP_SCALE_FACTOR,
-        transform=None,
-    ):
-        self.chunk_pixels = chunk_pixels
-        self.scale_factor = scale_factor
-        self.transform = transform
-
-        sat_path = root / flight_id / f"satellite{flight_id}.tif"
-        tile_paths = sorted((root / flight_id).glob(f"satellite{flight_id}_*.tif"))
-
-        if sat_path.exists():
-            with rasterio.open(sat_path) as src:
-                h = int(src.height * scale_factor)
-                w = int(src.width * scale_factor)
-                data = src.read([1, 2, 3], out_shape=(3, h, w), resampling=Resampling.bilinear)
-        elif tile_paths:
-            srcs = [rasterio.open(p) for p in tile_paths]
-            native_res = srcs[0].res
-            target_res = (native_res[0] / scale_factor, native_res[1] / scale_factor)
-            merged, _ = rasterio_merge(srcs, res=target_res, indexes=[1, 2, 3], resampling=Resampling.bilinear)
-            for s in srcs:
-                s.close()
-            data = merged
-            h, w = data.shape[1], data.shape[2]
-        else:
-            raise FileNotFoundError(f"No satellite TIF found for flight {flight_id}")
-
-        self._img = np.transpose(data, (1, 2, 0))  # (H, W, 3) uint8
-        self._bounds = _read_sat_bounds(root, flight_id)  # bounds from CSV (authoritative)
-        lat_min, lon_min, lat_max, lon_max = self._bounds
-
-        self._chunks: list[tuple[int, int, float, float]] = []
-        self._bboxes: list[tuple[float, float, float, float]] = []
-        for y in range(0, h - chunk_pixels, stride_pixels):
-            for x in range(0, w - chunk_pixels, stride_pixels):
-                cx = x + chunk_pixels // 2
-                cy = y + chunk_pixels // 2
-                lat = lat_max - (cy / h) * (lat_max - lat_min)
-                lon = lon_min + (cx / w) * (lon_max - lon_min)
-                self._chunks.append((x, y, lat, lon))
-                self._bboxes.append((
-                    lat_max - ((y + chunk_pixels) / h) * (lat_max - lat_min),  # lat_min of chunk
-                    lon_min + (x / w) * (lon_max - lon_min),                   # lon_min of chunk
-                    lat_max - (y / h) * (lat_max - lat_min),                   # lat_max of chunk
-                    lon_min + ((x + chunk_pixels) / w) * (lon_max - lon_min),  # lon_max of chunk
-                ))
-
-    @property
-    def chunk_coords(self) -> list[tuple[float, float]]:
-        return [(lat, lon) for _, _, lat, lon in self._chunks]
-
-    @property
-    def chunk_bboxes(self) -> list[tuple[float, float, float, float]]:
-        return self._bboxes
-
-    def __len__(self) -> int:
-        return len(self._chunks)
-
-    def __getitem__(self, idx: int):
-        x, y, lat, lon = self._chunks[idx]
-        crop = self._img[y:y + self.chunk_pixels, x:x + self.chunk_pixels]
-        img = Image.fromarray(crop)
-        if self.transform is not None:
-            img = self.transform(img)
-        return img, lat, lon
-
-
 # ---------------------------------------------------------------------------
 # Evaluation (DO NOT CHANGE — this is the fixed metric)
 # ---------------------------------------------------------------------------
+
 
 def _flat_earth_dist_m(lat1: float, lon1: float, lats: np.ndarray, lons: np.ndarray) -> np.ndarray:
     """Approximate flat-earth distance in metres from one point to an array of points."""
     dlat = (lats - lat1) * 111_111
     dlon = (lons - lon1) * 111_111 * np.cos(np.radians(lat1))
-    return np.sqrt(dlat ** 2 + dlon ** 2)
+    return np.sqrt(dlat**2 + dlon**2)
 
 
 def build_ground_truth(
@@ -215,12 +98,12 @@ def evaluate_r1(
     sat_n = sat_embs.astype(np.float32)
     uav_n /= np.linalg.norm(uav_n, axis=1, keepdims=True) + 1e-8
     sat_n /= np.linalg.norm(sat_n, axis=1, keepdims=True) + 1e-8
-    sim = uav_n @ sat_n.T          # (N_uav, N_sat) cosine similarity
+    sim = uav_n @ sat_n.T  # (N_uav, N_sat) cosine similarity
     preds = np.argsort(-sim, axis=1)  # descending rank
     gt = build_ground_truth(uav_coords, chunk_bboxes)
     return {
-        "R@1":  recall_at_k(preds, gt, 1),
-        "R@5":  recall_at_k(preds, gt, 5),
+        "R@1": recall_at_k(preds, gt, 1),
+        "R@5": recall_at_k(preds, gt, 5),
         "R@10": recall_at_k(preds, gt, 10),
     }
 
@@ -231,7 +114,6 @@ def evaluate_r1(
 
 if __name__ == "__main__":
     print(f"VISLOC_ROOT : {VISLOC_ROOT}")
-    print(f"HF_HOME     : {HF_HOME}")
     print(f"FLIGHT_ID   : {FLIGHT_ID}")
     print(f"TIME_BUDGET : {TIME_BUDGET}s")
     print()
@@ -241,12 +123,14 @@ if __name__ == "__main__":
     print(f"  UAV images   : {len(uav_ds)}")
 
     print("Loading satellite dataset...")
-    sat_ds = SatChunkDataset(VISLOC_ROOT, FLIGHT_ID)
+    sat_ds = SatChunkDataset(
+        VISLOC_ROOT,
+        FLIGHT_ID,
+        chunk_pixels=512,
+        stride_pixels=128,
+        scale_factor=0.25,
+    )
     print(f"  Sat chunks   : {len(sat_ds)}")
-
-    sd21_path = Path(HF_HOME) / "hub" / "models--sd2-community--stable-diffusion-2-1"
-    print()
-    print(f"SD21 cached  : {sd21_path.exists()}")
 
     print()
     print("Setup OK — ready to run experiments.")
