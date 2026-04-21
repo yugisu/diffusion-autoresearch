@@ -550,6 +550,7 @@ dependencies = [
     { name = "scikit-learn", version = "1.7.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "scikit-learn", version = "1.8.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "torch" },
+    { name = "torchsort" },
     { name = "torchvision" },
     { name = "tqdm" },
     { name = "transformers" },
@@ -568,6 +569,7 @@ requires-dist = [
     { name = "rasterio", specifier = ">=1.4.4" },
     { name = "scikit-learn", specifier = ">=1.5.0" },
     { name = "torch", specifier = "==2.3.1", index = "https://download.pytorch.org/whl/cu121" },
+    { name = "torchsort", specifier = ">=0.1.10" },
     { name = "torchvision", specifier = "==0.18.1" },
     { name = "tqdm", specifier = ">=4.67.3" },
     { name = "transformers", specifier = "==4.56.0" },
@@ -2798,6 +2800,15 @@ sdist = { url = "https://files.pythonhosted.org/packages/81/34/39b8b749333db56c0
 wheels = [
     { url = "https://files.pythonhosted.org/packages/c3/a2/c7f6ebf546f8f644edf0f999aa98ece106986a77a7b922316bf6414ff825/torchmetrics-1.9.0-py3-none-any.whl", hash = "sha256:bfdcbff3dd1d96b3374bb2496eb39f23c4b28b8a845b6a18c313688e0d2d9ca1", size = 983384, upload-time = "2026-03-09T17:41:19.756Z" },
 ]
+
+[[package]]
+name = "torchsort"
+version = "0.1.10"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "torch" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/57/c8/f643cdde8bcfe2c9c2460ffeac83e2fecac9d5bb48fddaf61970547275aa/torchsort-0.1.10.tar.gz", hash = "sha256:416a7dd2ab88332b27e98318d7fb2e0243b9fb6f1fffcf77760d63103d70dd04", size = 22376, upload-time = "2025-06-09T17:12:25.182Z" }
 
 [[package]]
 name = "torchvision"
