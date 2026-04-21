@@ -18,6 +18,7 @@ dependencies = [
     "accelerate==0.34.2",
     "lightning>=2.2.0",
     "wandb>=0.17.0",
+    "pytorch-metric-learning>=2.9.0",
 ]
 
 [tool.uv.sources]

@@ -37,6 +37,7 @@ from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts, LinearLR, Sequ
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 from transformers import AutoImageProcessor, AutoModel
+from pytorch_metric_learning import losses
 
 from prepare import (
     VISLOC_ROOT,
@@ -73,6 +74,19 @@ SAT_SCALES = {
     "11": 0.25,
 }
 
+TRAIN_SAT_SCALES = {
+    "01": 0.20,
+    "02": 0.20,
+    "03": 0.20,
+    "04": 0.20,
+    "05": 0.30,
+    "06": 0.45,
+    "08": 0.25,
+    "09": 0.20,
+    "10": 0.35,
+    "11": 0.20,
+}
+
 
 @dataclass
 class Config:
@@ -87,21 +101,20 @@ class Config:
 
     image_size: int = 336
 
+    max_epochs: int = 7
+    warmup_epochs: int = 1
     batch_size: int = 128
-    lr: float = 1e-5
+    lr: float = 5e-6
     weight_decay: float = 1e-4
-    warmup_epochs: int = 2
-    max_epochs: int = 13
+    cosine_t0: int = 0  # CosineAnnealingWarmRestarts period (0 = single cycle = plain cosine)
+    llrd_decay: float = 0.6  # per-block LR decay: block[n-1] gets lr*decay, block[n-2] gets lr*decay^2, ...
     gradient_clip_val: float = 1.0
 
     contrastive_temperature: float = 0.07  # contrastive temperature
-    georank_weight: float = 0.0  # weight for GeoRank regularization (0 = disabled)
+    georank_weight: float = 20.0  # weight for GeoRank regularization (0 = disabled)
     georank_temperature: float = (
         1.0  # sigmoid slope inside the soft rank - larger -> harder/sharper ranks (less gradient), smaller -> softer ranks
     )
-
-    cosine_t0: int = 0  # CosineAnnealingWarmRestarts period (0 = single cycle = plain cosine)
-    llrd_decay: float = 0.6  # per-block LR decay: block[n-1] gets lr*decay, block[n-2] gets lr*decay^2, ...
 
     wandb_project: str = "ssl-dinov3"
     wandb_run_name: str | None = None
@@ -229,23 +242,26 @@ class VisLocSSLDataModule(pl.LightningDataModule):
         mean = self.processor.image_mean
         std = self.processor.image_std
 
-        _random_90 = transforms.Lambda(lambda img: TF.rotate(img, random.choice([0, 90, 180, 270])))
+        # _random_90 = transforms.Lambda(lambda img: TF.rotate(img, random.choice([0, 90, 180, 270])))
         shared_aug = [
-            _random_90,  # Instead of Horizontal/Vertical flips, use random rotations.
             transforms.ToTensor(),
             transforms.Normalize(mean=mean, std=std),
         ]
         # Anchor: zoomed-in UAV-like crop + stronger sensor/temporal augmentation
         self.anchor_transform = transforms.Compose([
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.RandomVerticalFlip(p=0.5),
             # non-aggressive zoom-in because SAT_SCALES are designed that way to roughly match UAV viewpoints.
-            transforms.RandomResizedCrop(cfg.image_size, scale=(0.5, 0.75), ratio=(0.9, 1.1)),
-            transforms.ColorJitter(brightness=0.5, contrast=0.5, saturation=0.1, hue=0),
+            transforms.RandomResizedCrop(cfg.image_size, scale=(0.25, 0.5), ratio=(0.9, 1.1)),
+            transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.2, hue=0.1),
             *shared_aug,
         ])
         # Positive: full-scale satellite view — mild augmentation only
         self.positive_transform = transforms.Compose([
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.RandomVerticalFlip(p=0.5),
             transforms.RandomResizedCrop(cfg.image_size, scale=(0.75, 1.00), ratio=(0.9, 1.1)),
-            transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0, hue=0),
+            transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0, hue=0),
             *shared_aug,
         ])
 
@@ -262,7 +278,7 @@ class VisLocSSLDataModule(pl.LightningDataModule):
             self.train_ds = SatSSLDataset(
                 root=self.root,
                 flights=TRAIN_FLIGHTS,
-                sat_scales=SAT_SCALES,
+                sat_scales=TRAIN_SAT_SCALES,
                 anchor_transform=self.anchor_transform,
                 positive_transform=self.positive_transform,
                 iou_pos_threshold=self.cfg.iou_pos_threshold,
@@ -392,6 +408,9 @@ class DinoSSLRetrieverSt1(pl.LightningModule):
         for param in self.backbone.parameters():
             param.requires_grad = True
 
+        self._ntxent_loss = losses.NTXentLoss(temperature=cfg.contrastive_temperature)
+        self._ntxent_loss = losses.SelfSupervisedLoss(self._ntxent_loss)
+
         self._val_uav_embs = []
         self._val_sat_embs = []
         self._val_uav_coords = []
@@ -425,16 +444,19 @@ class DinoSSLRetrieverSt1(pl.LightningModule):
         negative_mask = (iou > self.cfg.iou_neg_threshold) & ~eye
         self.log("train/masked_neg_frac", negative_mask.float().mean(), on_step=True, on_epoch=False)
 
-        symnce = symnce_loss(q_ssl, k_ssl, self.cfg.contrastive_temperature, negative_mask=negative_mask)
-        self.log("train/symnce_loss", symnce, on_step=True, on_epoch=False)
+        infonce = symnce_loss(q_ssl, k_ssl, self.cfg.contrastive_temperature, negative_mask=negative_mask)
+        self.log("train/symnce_loss", infonce, on_step=True, on_epoch=False)
+
+        infonce = self._ntxent_loss(q_ssl, k_ssl)
+        self.log("train/ntxent_loss", infonce, on_step=True, on_epoch=False)
 
         if self.cfg.georank_weight > 0:
             gr = georank_loss(q, anchor_coords[:, 0], anchor_coords[:, 1], self.cfg.georank_temperature)
             self.log("train/georank_loss", gr, on_step=True, on_epoch=False)
 
-            loss = symnce + self.cfg.georank_weight * gr
+            loss = infonce + self.cfg.georank_weight * gr
         else:
-            loss = symnce
+            loss = infonce
 
         bs = anchor.size(0)
         self._total_samples_seen += bs
@@ -647,6 +669,7 @@ def main():
         gradient_clip_val=cfg.gradient_clip_val,
     )
 
+    trainer.validate(model, datamodule=datamodule)
     trainer.fit(model, datamodule=datamodule)
 
     # Upload run.log as wandb artifact
