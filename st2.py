@@ -6,13 +6,14 @@ Backbone: loaded from SSL Exp13 checkpoint (LoRA merged into weights), then full
 Training: multi-positive InfoNCE + GPS proximity mask + TwoFlightBatchSampler
           + CosineAnnealingWarmRestarts T_0=10 epochs (2 cycles) + grad clip 1.0 + head lr=2e-5.
 
-exp11 changes vs exp9:
-  - ReduceLROnPlateau instead of CosineAnnealingWarmRestarts. The warm restart was
-    consistently destructive with the GPS exclusion zone: cycle-1 peaks ~epoch 5,
-    restart at epoch 10 overshoots the basin, cycle-2 never recovers (exp9: 0.7786,
-    exp10 cycle-2 peak: 0.7604). ReduceLROnPlateau decays LR by 0.5 when val/R@1
-    stalls for 3 epochs — adaptive, monotonically decreasing, no destructive jumps.
-  - GPS exclusion zone, 3-flight sampling, 4-tier LLRD all retained from exp9.
+exp12 changes vs exp9:
+  - Tighter GPS threshold: 40m positive (was 60m), 40–100m ignored (was 60–150m).
+    Removes the 40-60m band from positives — these near-miss pairs add noise because
+    UAV and satellite may capture different ground features at 50m separation. Cleaner
+    positives → sharper InfoNCE signal. Ignore zone upper bound also pulled in (150→100m)
+    to let 100-150m pairs contribute as hard negatives.
+  - GPS exclusion zone structure, 3-flight sampling, 4-tier LLRD, CosineWarmRestarts
+    T_0=10 all retained from exp9.
 
 SSL checkpoint:  checkpoints/dinov3-ssl-best-r@1=0.53-e656447.ckpt
 Supervised baseline: R@1 = 73.6% (Exp16, trained from pretrained DINOv3)
@@ -43,7 +44,7 @@ import torch.nn.functional as F
 from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint
 from lightning.pytorch.loggers import WandbLogger
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import ReduceLROnPlateau
+from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 from transformers import AutoImageProcessor, AutoModel
@@ -427,7 +428,7 @@ class DinoCrossViewRetrieverST2(pl.LightningModule):
         return 0.5 * (loss_qk.mean() + loss_kq.mean())
 
     def _build_pos_mask(self, uav_coords: torch.Tensor, sat_coords: torch.Tensor,
-                        pos_threshold_m: float = 60.0, ignore_threshold_m: float = 150.0):
+                        pos_threshold_m: float = 40.0, ignore_threshold_m: float = 100.0):
         uav_lat = uav_coords[:, 0].cpu().numpy()
         uav_lon = uav_coords[:, 1].cpu().numpy()
         sat_lat = sat_coords[:, 0].cpu().numpy()
@@ -509,17 +510,12 @@ class DinoCrossViewRetrieverST2(pl.LightningModule):
         ]
         optimizer = AdamW(param_groups, weight_decay=self.cfg.weight_decay)
 
-        # ReduceLROnPlateau: halve LR when val/R@1 stalls 3 epochs. Monotonically
-        # decreasing — avoids destructive LR spikes from CosineWarmRestarts.
-        scheduler = ReduceLROnPlateau(optimizer, mode="max", factor=0.5, patience=3, min_lr=1e-7)
+        train_batches = max(len(self.trainer.datamodule.train_dataloader()), 1)
+        T_0 = 10 * train_batches  # 2 cycles over 20 epochs instead of 4; eliminates destructive late restarts
+        scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=T_0, T_mult=1, eta_min=2e-5 * 0.05)
         return {
             "optimizer": optimizer,
-            "lr_scheduler": {
-                "scheduler": scheduler,
-                "monitor": "val/R@1",
-                "interval": "epoch",
-                "frequency": 1,
-            },
+            "lr_scheduler": {"scheduler": scheduler, "interval": "step"},
         }
 
 
