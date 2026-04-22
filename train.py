@@ -126,7 +126,7 @@ class Config:
     ssl4eo_lon_max: float | None = None
 
     wandb_project: str = "autoresearch-ssl-dinov3"
-    wandb_run_name: str | None = None
+    wandb_run_name: str | None = "exp01-global-infonce-lora16"
 
 
 # -----------------------------------------------------------------------------
