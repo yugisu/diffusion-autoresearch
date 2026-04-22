@@ -6,11 +6,11 @@ Backbone: loaded from SSL Exp13 checkpoint (LoRA merged into weights), then full
 Training: multi-positive InfoNCE + GPS proximity mask + TwoFlightBatchSampler
           + CosineAnnealingWarmRestarts T_0=10 epochs (2 cycles) + grad clip 1.0 + head lr=2e-5.
 
-exp8 changes vs exp5:
-  - 3-layer projection head with LayerNorm: 768 → LN → GELU → 768 → LN → GELU → 512
-    (was 2-layer: 768 → GELU → Dropout → 512). More capacity to separate fine-grained
-    satellite similarities that cause R@1 failures. Dropout removed — LN provides
-    implicit regularisation and the head now matches SimCLR-style projection heads.
+exp9 changes vs exp5:
+  - GPS exclusion zone in InfoNCE loss: dist < 60m = positive, 60–150m = ignored
+    (excluded from denominator), dist > 150m = hard negative. Sharpens the decision
+    boundary by removing ambiguous near-miss satellite tiles that pollute both the
+    positive and negative sets at the 100m threshold used in exp1-8.
   - 3-flight sampling and 4-tier LLRD retained from exp5.
 
 SSL checkpoint:  checkpoints/dinov3-ssl-best-r@1=0.53-e656447.ckpt
@@ -390,11 +390,8 @@ class DinoCrossViewRetrieverST2(pl.LightningModule):
 
         self.proj = nn.Sequential(
             nn.Linear(hidden, hidden),
-            nn.LayerNorm(hidden),
             nn.GELU(),
-            nn.Linear(hidden, hidden),
-            nn.LayerNorm(hidden),
-            nn.GELU(),
+            nn.Dropout(0.1),
             nn.Linear(hidden, cfg.embedding_dim),
         )
 
@@ -415,18 +412,21 @@ class DinoCrossViewRetrieverST2(pl.LightningModule):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.encode(x)
 
-    def _multi_pos_infonce(self, q: torch.Tensor, k: torch.Tensor, pos_mask: torch.Tensor) -> torch.Tensor:
+    def _multi_pos_infonce(self, q: torch.Tensor, k: torch.Tensor, pos_mask: torch.Tensor, ignore_mask: torch.Tensor) -> torch.Tensor:
         scale = self.logit_scale.exp().clamp(max=100)
         logits = (q @ k.t()) * scale
-        log_probs = F.log_softmax(logits, dim=1)
+        # Mask out ignored pairs from softmax denominator (set to -inf)
+        masked_logits = logits - 1e9 * ignore_mask
+        log_probs = F.log_softmax(masked_logits, dim=1)
         n_pos = pos_mask.sum(dim=1).clamp(min=1)
         loss_qk = -(log_probs * pos_mask).sum(dim=1) / n_pos
-        log_probs_t = F.log_softmax(logits.t(), dim=1)
+        log_probs_t = F.log_softmax(masked_logits.t(), dim=1)
         n_pos_t = pos_mask.t().sum(dim=1).clamp(min=1)
         loss_kq = -(log_probs_t * pos_mask.t()).sum(dim=1) / n_pos_t
         return 0.5 * (loss_qk.mean() + loss_kq.mean())
 
-    def _build_pos_mask(self, uav_coords: torch.Tensor, sat_coords: torch.Tensor, threshold_m: float = 100.0) -> torch.Tensor:
+    def _build_pos_mask(self, uav_coords: torch.Tensor, sat_coords: torch.Tensor,
+                        pos_threshold_m: float = 60.0, ignore_threshold_m: float = 150.0):
         uav_lat = uav_coords[:, 0].cpu().numpy()
         uav_lon = uav_coords[:, 1].cpu().numpy()
         sat_lat = sat_coords[:, 0].cpu().numpy()
@@ -435,16 +435,22 @@ class DinoCrossViewRetrieverST2(pl.LightningModule):
         mean_lat = np.radians((uav_lat[:, None] + sat_lat[None, :]) / 2.0)
         dlon = (sat_lon[None, :] - uav_lon[:, None]) * 111111.0 * np.cos(mean_lat)
         dist = np.sqrt(dlat**2 + dlon**2)
-        mask = torch.tensor(dist < threshold_m, dtype=torch.float32, device=uav_coords.device)
-        mask = (mask + torch.eye(len(uav_lat), device=mask.device)).clamp(max=1.0)
-        return mask
+        eye = np.eye(len(uav_lat))
+        # positive: close enough, or diagonal (exact GPS pair)
+        pos_mask = torch.tensor(np.clip((dist < pos_threshold_m).astype(float) + eye, 0, 1),
+                                dtype=torch.float32, device=uav_coords.device)
+        # ignore: ambiguous zone between pos and hard negative (excl. diagonal)
+        ignore_zone = (dist >= pos_threshold_m) & (dist < ignore_threshold_m)
+        ignore_mask = torch.tensor((ignore_zone & (eye == 0)).astype(float),
+                                   dtype=torch.float32, device=uav_coords.device)
+        return pos_mask, ignore_mask
 
     def training_step(self, batch, batch_idx):
         uav, sat, uav_coords, sat_coords = batch
         q = self.encode(uav)
         k = self.encode(sat)
-        pos_mask = self._build_pos_mask(uav_coords, sat_coords)
-        loss = self._multi_pos_infonce(q, k, pos_mask)
+        pos_mask, ignore_mask = self._build_pos_mask(uav_coords, sat_coords)
+        loss = self._multi_pos_infonce(q, k, pos_mask, ignore_mask)
         self.log("train/loss", loss, on_step=True, on_epoch=True, prog_bar=True, batch_size=uav.size(0))
         self.log("train/logit_scale", self.logit_scale.exp(), on_step=True, on_epoch=False)
         return loss
