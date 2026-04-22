@@ -6,12 +6,11 @@ Backbone: loaded from SSL Exp13 checkpoint (LoRA merged into weights), then full
 Training: multi-positive InfoNCE + GPS proximity mask + TwoFlightBatchSampler
           + CosineAnnealingWarmRestarts T_0=10 epochs (2 cycles) + grad clip 1.0 + head lr=2e-5.
 
-exp9 changes vs exp5:
-  - GPS exclusion zone in InfoNCE loss: dist < 60m = positive, 60–150m = ignored
-    (excluded from denominator), dist > 150m = hard negative. Sharpens the decision
-    boundary by removing ambiguous near-miss satellite tiles that pollute both the
-    positive and negative sets at the 100m threshold used in exp1-8.
-  - 3-flight sampling and 4-tier LLRD retained from exp5.
+exp10 changes vs exp9:
+  - EarlyStopping patience=10 (was 6). Exp9 peaked epoch 5, restart at epoch 10
+    caused dip to 0.7409 at epoch 11, early stop fired immediately. Patience=10
+    survives through the restart dip and gives cycle-2 (epochs 11-15) time to climb.
+  - GPS exclusion zone, 3-flight sampling, 4-tier LLRD all retained from exp9.
 
 SSL checkpoint:  checkpoints/dinov3-ssl-best-r@1=0.53-e656447.ckpt
 Supervised baseline: R@1 = 73.6% (Exp16, trained from pretrained DINOv3)
@@ -602,7 +601,7 @@ def main():
         mode="max",
         save_top_k=1,
     )
-    early_stop_cb = EarlyStopping(monitor="val/R@1", mode="max", patience=6)
+    early_stop_cb = EarlyStopping(monitor="val/R@1", mode="max", patience=10)
 
     trainer = pl.Trainer(
         accelerator="auto",
