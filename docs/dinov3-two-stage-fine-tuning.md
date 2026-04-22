@@ -1,6 +1,6 @@
 # DINOv3 Two-Stage Fine-Tuning for UAV-to-Satellite Geo-Localization
 
-**Best result: R@1 = 78.9%** (Stage-2 experiment 9) on the VisLoc flight 03 validation set, using a two-stage SSL → supervised fine-tuning pipeline.
+**Best result: R@1 = 77.9%** (Stage-2 experiment 9) on the VisLoc flight 03 validation set, using a two-stage SSL → supervised fine-tuning pipeline.
 
 ---
 
@@ -30,7 +30,7 @@ satellite crops             with GPS proximity mask
   ↓                           ↓
 LoRA adapter (4 blocks)     Full backbone LLRD fine-tune
   ↓                           ↓
-R@1 = 53.0%                 R@1 = 78.9%  (+25.9 pp)
+R@1 = 53.0%                 R@1 = 77.9%  (+24.9 pp)
 ```
 
 **Why two stages?** Stage 1 adapts the DINOv3 backbone to satellite scale invariance without any UAV labels — it learns to match zoomed-in (UAV-like) views to full-scale (satellite-like) views using only satellite crops. Stage 2 then fine-tunes this adapted backbone with real UAV↔satellite pairs and GPS supervision, starting from a much better initialisation than the pretrained DINOv3 weights alone.
@@ -44,7 +44,7 @@ R@1 = 53.0%                 R@1 = 78.9%  (+25.9 pp)
 | Zero-shot DINOv3 (no training) | 0.340 | 0.587 | 0.673 |
 | SSL only — Stage 1 Exp13 (satellite-only, no UAV labels) | 0.530 | 0.664 | 0.706 |
 | Supervised only — Exp16 (from pretrained DINOv3) | 0.736 | 0.869 | 0.917 |
-| **Two-stage best — Stage-2 Exp9** | **0.779** | **0.895** | **0.941** |
+| **Two-stage best — Stage-2 Exp9** | **0.7786** | **0.8945** | **0.9414** |
 
 The two-stage approach beats supervised-only by **+4.3 pp R@1**, confirming that satellite SSL pre-adaptation provides a meaningful head-start for the downstream supervised task.
 
