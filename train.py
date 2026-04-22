@@ -3,16 +3,19 @@ Self-supervised DINOv3 training for VisLoc cross-view retrieval.
 
 Branch goal:
 - Fine-tune facebook/dinov3-vitb16-pretrain-lvd1689m with self-supervised learning
-- Train on satellite chunks only from flights: 01, 02, 04, 05, 06, 08, 09, 10, 11
+- Train on SSL4EO-S12 S2RGB satellite patches (244K global locations × 4 seasons)
+- SSL pairs: two seasonal timestamps of the same location
+  anchor = strong crop+jitter (UAV-like), positive = mild crop (satellite-like)
 - Validate on flight: 03 (768 UAV queries, 2860 satellite chunks)
 - Optimize for Recall@1 on fixed VisLoc evaluation
-- No UAV images during training — satellite chunks only
+- No UAV images during training
 
 Usage:
   uv run train.py > run.log 2>&1
 
 Environment (optional overrides):
   VISLOC_ROOT=/workspace/data/visloc
+  SSL4EOS12_ROOT=/workspace/data/SSL4EOS12
   WANDB_API_KEY=... (for automatic wandb login)
 """
 

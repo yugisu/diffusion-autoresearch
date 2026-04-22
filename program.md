@@ -33,14 +33,15 @@ Task details:
 - Model: `facebook/dinov3-vitb16-pretrain-lvd1689m`
 - Framework: PyTorch Lightning
 - Logging: Weights & Biases (`autoresearch-ssl-dinov3`, auth via env/WANDB_API_KEY)
-- Training approach: **Self-supervised learning on satellite chunks only** (no UAV images during training)
-- Training data: satellite chunks from flights `01, 02, 04, 05, 06, 08, 09, 10, 11` with stride_pixels=64 (denser than eval for more overlapping views)
+- Training approach: **Self-supervised learning on satellite imagery only** (no UAV images during training)
+- Training data: **SSL4EO-S12 S2RGB** patches at `/workspace/data/SSL4EOS12` — 244K global locations × 4 seasonal timestamps, 264×264 px RGB uint8. Loaded via `build_ssl4eo_ssl_pipeline` in `train.py` (uses `train_metadata.parquet` for geographic shard pre-filtering). SSL pairs are drawn from two different seasonal timestamps of the same location: anchor = strong crop+jitter (UAV-like), positive = mild crop (satellite-like).
+- Optional geographic filter: `--ssl4eo-lat-min 15 --ssl4eo-lat-max 55 --ssl4eo-lon-min 90 --ssl4eo-lon-max 135` restricts to the China / East Asia region matching VisLoc flights (~21K samples).
 - Validation flight: `03` (768 UAV queries, 2860 satellite chunks at default eval stride)
 - Primary metric: `R@1` on flight 03, evaluated with fixed `evaluate_r1` in `prepare.py`
 - Zero-shot baseline (pretrained DINOv3, no training): **R@1 = 0.3398**
 - Previous supervised best (for reference only): R@1 = 0.7357
 
-Satellite scale priors (usable with SatChunkDataset, adjustable as per your experiments):
+Satellite scale priors (usable with SatChunkDataset if adding VisLoc chunks to training):
 
 ```python
 sat_scales = {"01": 0.25,"02": 0.25,"03": 0.25,"04": 0.25,"05": 0.4,"06": 0.6,"08": 0.35,"09": 0.25,"10": 0.5,"11": 0.25,}
@@ -58,21 +59,25 @@ sat_scales = {"01": 0.25,"02": 0.25,"03": 0.25,"04": 0.25,"05": 0.4,"06": 0.6,"0
 
 Training experiments are conducted **strictly in the given order**. Step 6 unlocks freedom for exploration based on winners from previous experiments.
 
-1. **InfoNCE baseline**: InfoNCE objective (same loss structure as the supervised setup). The key difference is training data — instead of UAV-satellite pairs, use satellite-only pairs where chunks with **IoU > 0.25 are positives** and chunks with **IoU = 0 are negatives**. Chunks with 0 < IoU <= 0.25 are excluded from the loss.
-2. **VICReg & VICRegL**: Try VICReg and VICRegL as alternative objectives. VICRegL includes a local patch correspondence term that may help with spatial discrimination.
-3. **Multi-scale chunks**: Add chunks at scale_factor // 2 (zoomed out, covering 4× the area) to the training pool. Cut max_epochs by a factor of 1.5 to compensate for the larger dataset.
-4. **GeoRank regularization**: Add a coordinate-based GeoRank rank-preservation regularization term to the best objective from experiments 1-3. Also explore geographic hard negative mining for the contrastive loss.
-5. **Validation flight satellite data**: Add satellite chunks from flight 03 to SSL training. This is not "cheating" — the model never sees UAV query images or GPS labels, only unlabeled satellite tiles. This lets the model learn the visual structure of the evaluation region.
+All experiments use SSL4EO-S12 S2RGB as the base training corpus unless stated otherwise. The canonical SSL pair is: two different seasonal timestamps of the same geographic location, anchor with strong augmentation, positive with mild augmentation.
+
+1. **InfoNCE baseline (global data)**: InfoNCE with SSL4EO-S12, all 244K global locations, no geographic filter. Seasonal timestamp pairs as positives, in-batch negatives. Default config: batch=128, lr=1e-5, LoRA last-4-blocks, max_epochs=13.
+2. **China-region filter**: Restrict training data to lat 15–55 / lon 90–135 (~21K samples matching VisLoc flight regions). Compare against Exp1 — more domain-relevant vs less data. Use `--ssl4eo-lat-min 15 --ssl4eo-lat-max 55 --ssl4eo-lon-min 90 --ssl4eo-lon-max 135`.
+3. **GeoRank regularization**: Add `georank_weight=0.1` to the best of Exp1/2. GeoRank ties embedding similarity ranks to geographic distance ranks (Burgert et al., WACV 2025).
+4. **VICReg objective**: Swap InfoNCE for VICReg (variance–invariance–covariance regularization). May avoid false-negative issues inherent to in-batch contrastive when seasonal pairs have visually similar negatives.
+5. **VisLoc satellite chunks mixed in**: Add satellite chunks from all VisLoc flights (stride=64) alongside SSL4EO-S12 to the training pool. This lets the model learn the exact visual domain of the evaluation region. Not cheating — no UAV images or GPS labels used.
 6. **Free experimentation**: Try combinations of what worked from experiments 1-5, tune hyperparameters, try alternative sampling strategies. Explore and exploit.
 7. **Canny reconstruction** (optional): Add a Canny edge reconstruction objective — the model predicts a Canny-filtered version of the input image. Goal is to learn edge/structure features that transfer across the UAV-satellite domain gap.
 8. **DINO self-distillation** (optional, if R@1 < 0.50 after experiments 1-6): Teacher-student setup. Init both from pretrained DINOv3 weights. Teacher is EMA of student (momentum 0.996→1.0 cosine schedule). Student sees local crops, teacher sees global crops. Standard DINO continued pretraining — no architectural novelty needed. **Budget: 4 hours** (DINO requires multi-crop which is compute-intensive).
 
 ### Training notes
 
-- **Training data stride**: Use stride_pixels=64 for training satellite chunks (4× denser than default, ~100k chunks total). Eval stride stays at the default from prepare.py.
+- **SSL4EO-S12 data loading**: `build_ssl4eo_ssl_pipeline` in `train.py` reads `train_metadata.parquet` to pre-filter shards by lat/lon, then does a per-sample secondary filter inside each shard (shards have global mixing). Batching is done inside the pipeline (webdataset `.batched()`), so the DataLoader uses `batch_size=None`.
+- **Seasonal pairs**: Each SSL4EO-S12 sample has 4 seasonal timestamps (Spring/Summer/Autumn/Winter). Two timestamps are sampled without replacement per forward pass; t1 → anchor (strong aug), t2 → positive (mild aug). This teaches temporal/seasonal invariance on top of scale invariance.
+- **Training data stride for VisLoc chunks** (if added): Use stride_pixels=64 for training satellite chunks (4× denser than default). Eval stride stays at the default from prepare.py.
 - **Augmentation guidance**: Geometric/scale augmentations (flips, 90° rotations, random resized crop) perform better than color augmentations for satellite SSL. Include slight brightness and contrast jitter (`ColorJitter(brightness=0.3, contrast=0.3, saturation=0, hue=0)`) to simulate weather conditions without altering spectral relationships. Avoid hue/saturation jitter.
 - **Logging**: Track total samples seen by the model, log LR, elapsed time × samples, and elapsed time × optimizer step metrics. Attach `run.log` to wandb as an artifact.
-- **Initial max_epochs**: 20. Agent can adjust freely if experiments justify it.
+- **Initial max_epochs**: 13 (inherited from previous best run). Agent can adjust freely if experiments justify it.
 
 ### Research context
 
@@ -162,7 +167,9 @@ A prior supervised training run fine-tuned DINOv3 on UAV-satellite pairs with mu
 
 ### Dataset description
 
-VisLoc dataset: UAV images are high-quality nadir photos from a Mavic-like drone. Satellite imagery is a large GeoTIFF map split into overlapping chunks. The goal is UAV-to-satellite geo-localization through image retrieval. The domain gap comes from camera quality differences (UAV images have better quality, different colors, slight haze, lower contrast) and potential timing differences (satellite images may be outdated). Training regions include some bodies of water.
+**VisLoc**: UAV images are high-quality nadir photos from a Mavic-like drone. Satellite imagery is a large GeoTIFF map split into overlapping chunks. The goal is UAV-to-satellite geo-localization through image retrieval. The domain gap comes from camera quality differences (UAV images have better quality, different colors, slight haze, lower contrast) and potential timing differences (satellite images may be outdated). All VisLoc flights are in China (lat 24–41°, lon 100–121°). Training regions include some bodies of water.
+
+**SSL4EO-S12 v1.1** (`/workspace/data/SSL4EOS12`): Global satellite dataset with 246K locations × 4 seasonal Sentinel-2 timestamps. The S2RGB modality (used here) is 264×264 px RGB uint8. Data is organized as WebDataset TAR shards (`train/S2RGB/ssl4eos12_shard_*.tar`, 477 shards × 512 samples). A `train_metadata.parquet` at the root provides per-sample center_lat, center_lon, tar filename, and cloud_cover per season — used for efficient geographic pre-filtering. Source: https://huggingface.co/datasets/embed2scale/SSL4EO-S12-v1.1
 
 ### Environment
 
