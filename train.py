@@ -114,6 +114,7 @@ class Config:
     max_epochs: int = 13
     max_steps: int = -1
     steps_per_epoch: int = 1000  # limit_train_batches; 0 = natural exhaustion
+    time_budget_hours: float = 2.0  # wall-clock budget; 0 = no limit
     precision: str = "16-mixed"
     seed: int = 42
 
@@ -194,6 +195,33 @@ def apply_lora(model: nn.Module, rank: int = 16, alpha: float = 32.0, last_n_blo
                 parent = getattr(parent, part)
         setattr(parent, attr_name, LoRALinear(getattr(parent, attr_name), rank, alpha))
     return model
+
+
+# -----------------------------------------------------------------------------
+# Time-budget callback
+# -----------------------------------------------------------------------------
+
+
+class TimeBudgetCallback(pl.Callback):
+    """Stop training after a wall-clock time budget. Checked at epoch end."""
+
+    def __init__(self, budget_hours: float):
+        self.budget_seconds = budget_hours * 3600
+        self._start: float | None = None
+
+    def on_train_start(self, trainer, pl_module):
+        self._start = time.time()
+
+    def on_train_epoch_end(self, trainer, pl_module):
+        if self._start is None:
+            return
+        elapsed = time.time() - self._start
+        if elapsed >= self.budget_seconds:
+            print(
+                f"[TimeBudget] {elapsed/3600:.2f}h elapsed ≥ {self.budget_seconds/3600:.1f}h budget. "
+                "Setting trainer.should_stop = True."
+            )
+            trainer.should_stop = True
 
 
 # -----------------------------------------------------------------------------
@@ -721,6 +749,7 @@ def parse_args() -> Config:
     parser.add_argument("--max-epochs", type=int, default=Config.max_epochs)
     parser.add_argument("--max-steps", type=int, default=Config.max_steps)
     parser.add_argument("--steps-per-epoch", type=int, default=Config.steps_per_epoch)
+    parser.add_argument("--time-budget-hours", type=float, default=Config.time_budget_hours)
     parser.add_argument("--precision", type=str, default=Config.precision)
     parser.add_argument("--seed", type=int, default=Config.seed)
 
@@ -762,6 +791,7 @@ def parse_args() -> Config:
         max_epochs=args.max_epochs,
         max_steps=args.max_steps,
         steps_per_epoch=args.steps_per_epoch,
+        time_budget_hours=args.time_budget_hours,
         precision=args.precision,
         seed=args.seed,
         warmup_epochs=args.warmup_epochs,
@@ -826,6 +856,9 @@ def main():
         save_top_k=1,
     )
     early_stop_cb = EarlyStopping(monitor="val/R@1", mode="max", patience=5)
+    callbacks = [ckpt_cb, early_stop_cb]
+    if cfg.time_budget_hours > 0:
+        callbacks.append(TimeBudgetCallback(cfg.time_budget_hours))
 
     limit_train_batches = cfg.steps_per_epoch if cfg.steps_per_epoch > 0 else 1.0
     trainer = pl.Trainer(
@@ -836,7 +869,7 @@ def main():
         limit_train_batches=limit_train_batches,
         precision=cfg.precision,
         logger=wandb_logger,
-        callbacks=[ckpt_cb, early_stop_cb],
+        callbacks=callbacks,
         log_every_n_steps=5,
         benchmark=True,
     )
