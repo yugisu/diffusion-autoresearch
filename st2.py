@@ -6,12 +6,12 @@ Backbone: loaded from SSL Exp13 checkpoint (LoRA merged into weights), then full
 Training: multi-positive InfoNCE + GPS proximity mask + TwoFlightBatchSampler
           + CosineAnnealingWarmRestarts T_0=10 epochs (2 cycles) + grad clip 1.0 + head lr=2e-5.
 
-exp7 changes vs exp5:
-  - batch_size=96 with k_flights=3: 32 samples per flight (was 21 with batch=64).
-    Same per-flight density as exp3's 2-flight setup (32/flight) but with 3 geographic
-    regions — maximises hard negative diversity without losing per-flight coverage.
-  - Reverts to max_epochs=20 / T_0=10 (longer schedule didn't help in exp6).
-  - 4-tier LLRD and 3-flight sampler retained from exp5.
+exp8 changes vs exp5:
+  - 3-layer projection head with LayerNorm: 768 → LN → GELU → 768 → LN → GELU → 512
+    (was 2-layer: 768 → GELU → Dropout → 512). More capacity to separate fine-grained
+    satellite similarities that cause R@1 failures. Dropout removed — LN provides
+    implicit regularisation and the head now matches SimCLR-style projection heads.
+  - 3-flight sampling and 4-tier LLRD retained from exp5.
 
 SSL checkpoint:  checkpoints/dinov3-ssl-best-r@1=0.53-e656447.ckpt
 Supervised baseline: R@1 = 73.6% (Exp16, trained from pretrained DINOv3)
@@ -168,7 +168,7 @@ class Config:
     image_size: int = 336
     embedding_dim: int = 512
 
-    batch_size: int = 96
+    batch_size: int = 64
     eval_batch_size: int = 128
     num_workers: int = 8
 
@@ -390,8 +390,11 @@ class DinoCrossViewRetrieverST2(pl.LightningModule):
 
         self.proj = nn.Sequential(
             nn.Linear(hidden, hidden),
+            nn.LayerNorm(hidden),
             nn.GELU(),
-            nn.Dropout(0.1),
+            nn.Linear(hidden, hidden),
+            nn.LayerNorm(hidden),
+            nn.GELU(),
             nn.Linear(hidden, cfg.embedding_dim),
         )
 
