@@ -6,14 +6,20 @@ Backbone: loaded from SSL Exp13 checkpoint (LoRA merged into weights), then full
 Training: multi-positive InfoNCE + GPS proximity mask + TwoFlightBatchSampler
           + CosineAnnealingWarmRestarts T_0=10 epochs (2 cycles) + grad clip 1.0 + head lr=2e-5.
 
-exp12 changes vs exp9:
-  - Tighter GPS threshold: 40m positive (was 60m), 40–100m ignored (was 60–150m).
-    Removes the 40-60m band from positives — these near-miss pairs add noise because
-    UAV and satellite may capture different ground features at 50m separation. Cleaner
-    positives → sharper InfoNCE signal. Ignore zone upper bound also pulled in (150→100m)
-    to let 100-150m pairs contribute as hard negatives.
-  - GPS exclusion zone structure, 3-flight sampling, 4-tier LLRD, CosineWarmRestarts
-    T_0=10 all retained from exp9.
+exp13 changes vs exp9:
+  - UAV 4-rotation TTA at validation: average embeddings over 0°/90°/180°/270°
+    rotations, then re-normalise. UAV drone heading varies freely; satellite has
+    north-up orientation. Current training gives satellite rotation invariance but
+    UAV gets only horizontal flip. TTA closes the orientation gap at inference and
+    directly targets the R@1/R@10 difference (correct chunk is in top-10 94% of the
+    time; TTA should push it to rank-1 more often).
+  - Satellite embedding queue (size=128) for hard negative mining: maintain a
+    circular buffer of recent satellite embeddings + GPS coords across training steps
+    within each epoch. Augment the InfoNCE denominator with GPS-far queue entries
+    (dist > 60m from UAV anchor). Forces the model to discriminate visually-similar
+    but geographically-distinct tiles — the actual cause of R@1 failures.
+  - GPS exclusion zone (60m pos / 60-150m ignored), 3-flight sampling, 4-tier LLRD,
+    CosineWarmRestarts T_0=10 all retained from exp9.
 
 SSL checkpoint:  checkpoints/dinov3-ssl-best-r@1=0.53-e656447.ckpt
 Supervised baseline: R@1 = 73.6% (Exp16, trained from pretrained DINOv3)
@@ -405,6 +411,11 @@ class DinoCrossViewRetrieverST2(pl.LightningModule):
         self._val_sat_embs: list = []
         self._val_uav_coords: list = []
 
+        # Satellite queue for hard negative mining (within epoch, cleared each epoch)
+        self._sat_queue_embs: list = []
+        self._sat_queue_coords: list = []
+        self._queue_max_size: int = 128  # ~2 batches of 64
+
     def encode(self, x: torch.Tensor) -> torch.Tensor:
         out = self.backbone(pixel_values=x)
         cls = out.last_hidden_state[:, 0]
@@ -414,21 +425,51 @@ class DinoCrossViewRetrieverST2(pl.LightningModule):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.encode(x)
 
-    def _multi_pos_infonce(self, q: torch.Tensor, k: torch.Tensor, pos_mask: torch.Tensor, ignore_mask: torch.Tensor) -> torch.Tensor:
+    def _multi_pos_infonce(self, q: torch.Tensor, k: torch.Tensor, pos_mask: torch.Tensor,
+                           ignore_mask: torch.Tensor, uav_coords: torch.Tensor | None = None) -> torch.Tensor:
         scale = self.logit_scale.exp().clamp(max=100)
         logits = (q @ k.t()) * scale
-        # Mask out ignored pairs from softmax denominator (set to -inf)
         masked_logits = logits - 1e9 * ignore_mask
-        log_probs = F.log_softmax(masked_logits, dim=1)
-        n_pos = pos_mask.sum(dim=1).clamp(min=1)
-        loss_qk = -(log_probs * pos_mask).sum(dim=1) / n_pos
+
+        # Augment denominator with satellite queue negatives (GPS-far from each UAV anchor)
+        if uav_coords is not None and len(self._sat_queue_embs) > 0:
+            queue_embs = torch.cat(self._sat_queue_embs, dim=0).to(q.device)    # (Q, D)
+            queue_coords = torch.cat(self._sat_queue_coords, dim=0).to(q.device) # (Q, 2)
+            # GPS distance: UAV (B,1) vs queue (1,Q)
+            uav_lat = uav_coords[:, 0:1]
+            uav_lon = uav_coords[:, 1:2]
+            q_lat = queue_coords[:, 0].unsqueeze(0)  # (1, Q)
+            q_lon = queue_coords[:, 1].unsqueeze(0)
+            dlat = (uav_lat - q_lat) * 111111.0
+            mean_lat_rad = ((uav_lat + q_lat) / 2.0) * (np.pi / 180.0)
+            dlon = (uav_lon - q_lon) * 111111.0 * torch.cos(mean_lat_rad)
+            dist = torch.sqrt(dlat ** 2 + dlon ** 2)  # (B, Q)
+            # Only GPS-far entries are hard negatives (beyond ignore zone)
+            gps_neg = (dist > 150.0).float()
+            queue_logits = (q @ queue_embs.t()) * scale  # (B, Q)
+            queue_logits = queue_logits - 1e9 * (1.0 - gps_neg)
+            # Augmented forward pass: in-batch + queue in denominator
+            full_logits = torch.cat([masked_logits, queue_logits], dim=1)
+            pos_full = torch.cat([
+                pos_mask,
+                torch.zeros(pos_mask.shape[0], queue_embs.shape[0], device=q.device)
+            ], dim=1)
+            log_probs = F.log_softmax(full_logits, dim=1)
+            n_pos = pos_full.sum(dim=1).clamp(min=1)
+            loss_qk = -(log_probs * pos_full).sum(dim=1) / n_pos
+        else:
+            log_probs = F.log_softmax(masked_logits, dim=1)
+            n_pos = pos_mask.sum(dim=1).clamp(min=1)
+            loss_qk = -(log_probs * pos_mask).sum(dim=1) / n_pos
+
+        # Symmetric K→Q (in-batch only; queue entries are satellites, not UAV queries)
         log_probs_t = F.log_softmax(masked_logits.t(), dim=1)
         n_pos_t = pos_mask.t().sum(dim=1).clamp(min=1)
         loss_kq = -(log_probs_t * pos_mask.t()).sum(dim=1) / n_pos_t
         return 0.5 * (loss_qk.mean() + loss_kq.mean())
 
     def _build_pos_mask(self, uav_coords: torch.Tensor, sat_coords: torch.Tensor,
-                        pos_threshold_m: float = 40.0, ignore_threshold_m: float = 100.0):
+                        pos_threshold_m: float = 60.0, ignore_threshold_m: float = 150.0):
         uav_lat = uav_coords[:, 0].cpu().numpy()
         uav_lon = uav_coords[:, 1].cpu().numpy()
         sat_lat = sat_coords[:, 0].cpu().numpy()
@@ -447,12 +488,25 @@ class DinoCrossViewRetrieverST2(pl.LightningModule):
                                    dtype=torch.float32, device=uav_coords.device)
         return pos_mask, ignore_mask
 
+    def on_train_epoch_start(self):
+        # Clear stale queue at epoch boundary (model weights changed significantly)
+        self._sat_queue_embs.clear()
+        self._sat_queue_coords.clear()
+
     def training_step(self, batch, batch_idx):
         uav, sat, uav_coords, sat_coords = batch
         q = self.encode(uav)
         k = self.encode(sat)
         pos_mask, ignore_mask = self._build_pos_mask(uav_coords, sat_coords)
-        loss = self._multi_pos_infonce(q, k, pos_mask, ignore_mask)
+        loss = self._multi_pos_infonce(q, k, pos_mask, ignore_mask, uav_coords)
+        # Enqueue satellite embeddings for hard negative mining in subsequent steps
+        self._sat_queue_embs.append(k.detach().cpu())
+        self._sat_queue_coords.append(sat_coords.detach().cpu())
+        total = sum(e.shape[0] for e in self._sat_queue_embs)
+        while total > self._queue_max_size and self._sat_queue_embs:
+            removed = self._sat_queue_embs.pop(0)
+            self._sat_queue_coords.pop(0)
+            total -= removed.shape[0]
         self.log("train/loss", loss, on_step=True, on_epoch=True, prog_bar=True, batch_size=uav.size(0))
         self.log("train/logit_scale", self.logit_scale.exp(), on_step=True, on_epoch=False)
         return loss
@@ -465,7 +519,12 @@ class DinoCrossViewRetrieverST2(pl.LightningModule):
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
         imgs, lat, lon = batch
         if dataloader_idx == 0:
-            emb = self.encode(imgs)
+            # UAV TTA: 4 rotations — drone heading varies, orientation-invariant embedding
+            e0 = self.encode(imgs)
+            e1 = self.encode(torch.rot90(imgs, 1, [2, 3]))
+            e2 = self.encode(torch.rot90(imgs, 2, [2, 3]))
+            e3 = self.encode(torch.rot90(imgs, 3, [2, 3]))
+            emb = F.normalize((e0 + e1 + e2 + e3) / 4.0, dim=-1)
             self._val_uav_embs.append(emb.detach().cpu())
             self._val_uav_coords.append(torch.stack([lat, lon], dim=1).detach().cpu())
         else:
