@@ -21,12 +21,12 @@ from __future__ import annotations
 import argparse
 import math
 import os
-import random
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Tuple
 
+import pandas as pd
 import lightning.pytorch as pl
 import numpy as np
 import torch
@@ -34,9 +34,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint
 from lightning.pytorch.loggers import WandbLogger
+from PIL import Image
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, default_collate
 from torchvision import transforms
 from transformers import AutoImageProcessor, AutoModel
 
@@ -44,12 +45,14 @@ from prepare import (
     CHUNK_PIXELS,
     CHUNK_STRIDE,
     MAP_SCALE_FACTOR,
+    SSL4EOS12_ROOT,
     VISLOC_ROOT,
     SatChunkDataset,
     UAVDataset,
     build_ground_truth,
     evaluate_r1,
 )
+from ssl4eos12_dataset import build_ssl4eos12_dataset
 
 torch.set_float32_matmul_precision("high")
 
@@ -108,6 +111,15 @@ class Config:
     max_steps: int = -1
     precision: str = "16-mixed"
     seed: int = 42
+
+    # SSL4EO-S12 training data
+    ssl4eo_root: str = str(SSL4EOS12_ROOT)
+    # Optional geographic bounding-box filter (degrees).  None = global.
+    # VisLoc flights are in China; set to (15, 55) / (90, 135) to focus there.
+    ssl4eo_lat_min: float | None = None
+    ssl4eo_lat_max: float | None = None
+    ssl4eo_lon_min: float | None = None
+    ssl4eo_lon_max: float | None = None
 
     wandb_project: str = "autoresearch-ssl-dinov3"
     wandb_run_name: str | None = None
@@ -249,6 +261,95 @@ class SatSSLDataset(Dataset):
 
 
 # -----------------------------------------------------------------------------
+# SSL4EO-S12 training pipeline — parquet-filtered shards, seasonal SSL pairs
+# -----------------------------------------------------------------------------
+
+
+def build_ssl4eo_ssl_pipeline(
+    data_root: str | Path,
+    anchor_transform,
+    positive_transform,
+    lat_range: tuple[float, float] | None = None,
+    lon_range: tuple[float, float] | None = None,
+    batch_size: int = 128,
+    shuffle: bool = True,
+    seed: int = 42,
+):
+    """
+    Build a WebDataset pipeline for SSL4EO-S12 S2RGB SSL training.
+
+    Uses train_metadata.parquet to select only shards that contain samples
+    inside the requested geographic bounding box — avoids streaming irrelevant
+    shards.  Within each selected shard a second lat/lon check drops the
+    minority of samples that fall outside the box (shards have global mixing).
+
+    Each decoded sample yields an (anchor, positive, coords, coords) tuple:
+      anchor   — seasonal view t1 with strong crop+jitter augmentation
+      positive — seasonal view t2 (different season) with mild augmentation
+
+    The pipeline handles its own batching via .batched(), so the DataLoader
+    should be created with batch_size=None.
+    """
+    root = Path(data_root)
+
+    # Use parquet to get the set of shards that cover the target region.
+    meta = pd.read_parquet(root / "train_metadata.parquet")
+    if lat_range is not None:
+        meta = meta[meta["center_lat"].between(*lat_range)]
+    if lon_range is not None:
+        meta = meta[meta["center_lon"].between(*lon_range)]
+
+    shard_names = sorted(meta["tar"].unique())
+    shard_urls = [str(root / "train" / "S2RGB" / f) for f in shard_names]
+    n_samples = len(meta)
+
+    geo_str = f"lat {lat_range}, lon {lon_range}" if lat_range else "global"
+    print(
+        f"SSL4EO-S12: {len(shard_urls)} shards, {n_samples:,} samples | {geo_str}"
+    )
+
+    # Base pipeline: decode zarr with metadata → sample["image"] = (4,3,264,264)
+    base = build_ssl4eos12_dataset(
+        path=str(root),
+        modalities=["S2RGB"],
+        split="train",
+        urls=shard_urls,
+        batch_size=None,
+        transform=None,
+        return_metadata=True,
+        shuffle=shuffle,
+        shardshuffle=min(len(shard_urls), 200) if shuffle else 0,
+        seed=seed,
+        partial=False,
+    )
+
+    def to_ssl_pair(sample):
+        lat = float(sample.get("center_lat", 0.0))
+        lon = float(sample.get("center_lon", 0.0))
+        # Fine-grained filter: shards contain mixed locations, cull stragglers.
+        if lat_range is not None and not (lat_range[0] <= lat <= lat_range[1]):
+            return None
+        if lon_range is not None and not (lon_range[0] <= lon <= lon_range[1]):
+            return None
+
+        bands = sample["image"]  # (T, 3, 264, 264) uint8
+        T = bands.shape[0]
+        t1, t2 = np.random.choice(T, 2, replace=False).tolist() if T >= 2 else (0, 0)
+        img_a = Image.fromarray(np.transpose(bands[t1], (1, 2, 0)))
+        img_p = Image.fromarray(np.transpose(bands[t2], (1, 2, 0)))
+
+        coords = torch.tensor([lat, lon], dtype=torch.float32)
+        return anchor_transform(img_a), positive_transform(img_p), coords, coords
+
+    return (
+        base
+        .map(to_ssl_pair)
+        .select(lambda x: x is not None)
+        .batched(batch_size, collation_fn=default_collate)
+    )
+
+
+# -----------------------------------------------------------------------------
 # Data module
 # -----------------------------------------------------------------------------
 
@@ -262,6 +363,7 @@ class VisLocSSLDataModule(pl.LightningDataModule):
         self.train_ds = None
         self.val_uav_ds = None
         self.val_sat_ds = None
+        self._wds_pipeline = False  # True when train_ds is a wds pipeline (batches itself)
 
         self.processor = AutoImageProcessor.from_pretrained(cfg.model_name, trust_remote_code=True)
         mean = self.processor.image_mean
@@ -298,14 +400,42 @@ class VisLocSSLDataModule(pl.LightningDataModule):
 
     def setup(self, stage: str | None = None):
         if self.train_ds is None:
-            self.train_ds = SatSSLDataset(
-                root=self.root,
-                flights=TRAIN_FLIGHTS,
-                sat_scales=SAT_SCALES,
-                anchor_transform=self.anchor_transform,
-                positive_transform=self.positive_transform,
-                iou_pos_threshold=self.cfg.iou_pos_threshold,
-            )
+            ssl4eo_shard_dir = Path(self.cfg.ssl4eo_root) / "train" / "S2RGB"
+            if ssl4eo_shard_dir.exists() and any(ssl4eo_shard_dir.glob("*.tar")):
+                lat_range = (
+                    (self.cfg.ssl4eo_lat_min, self.cfg.ssl4eo_lat_max)
+                    if self.cfg.ssl4eo_lat_min is not None
+                    else None
+                )
+                lon_range = (
+                    (self.cfg.ssl4eo_lon_min, self.cfg.ssl4eo_lon_max)
+                    if self.cfg.ssl4eo_lon_min is not None
+                    else None
+                )
+                self.train_ds = build_ssl4eo_ssl_pipeline(
+                    data_root=self.cfg.ssl4eo_root,
+                    anchor_transform=self.anchor_transform,
+                    positive_transform=self.positive_transform,
+                    lat_range=lat_range,
+                    lon_range=lon_range,
+                    batch_size=self.cfg.batch_size,
+                    shuffle=True,
+                    seed=self.cfg.seed,
+                )
+                self._wds_pipeline = True
+            else:
+                print(
+                    f"SSL4EO-S12 shards not found at {ssl4eo_shard_dir}; "
+                    "falling back to VisLoc satellite chunks."
+                )
+                self.train_ds = SatSSLDataset(
+                    root=self.root,
+                    flights=TRAIN_FLIGHTS,
+                    sat_scales=SAT_SCALES,
+                    anchor_transform=self.anchor_transform,
+                    positive_transform=self.positive_transform,
+                    iou_pos_threshold=self.cfg.iou_pos_threshold,
+                )
 
         if self.val_uav_ds is None or self.val_sat_ds is None:
             val_scale = SAT_SCALES.get(VAL_FLIGHT, MAP_SCALE_FACTOR)
@@ -323,6 +453,16 @@ class VisLocSSLDataModule(pl.LightningDataModule):
             )
 
     def train_dataloader(self):
+        if self._wds_pipeline:
+            # wds pipeline batches itself — DataLoader is just a thin wrapper.
+            return DataLoader(
+                dataset=self.train_ds,
+                batch_size=None,
+                shuffle=False,
+                num_workers=self.cfg.num_workers,
+                pin_memory=True,
+                persistent_workers=self.cfg.num_workers > 0,
+            )
         return DataLoader(
             dataset=self.train_ds,
             batch_size=self.cfg.batch_size,
@@ -584,6 +724,17 @@ def parse_args() -> Config:
     parser.add_argument("--wandb-run-name", type=str, default=None)
     parser.add_argument("--model-name", type=str, default=DINO_MODEL)
 
+    # SSL4EO-S12 options
+    parser.add_argument("--ssl4eo-root", type=str, default=str(SSL4EOS12_ROOT))
+    parser.add_argument("--ssl4eo-lat-min", type=float, default=None,
+                        help="Geographic filter: southern latitude bound (e.g. 15.0 for China region)")
+    parser.add_argument("--ssl4eo-lat-max", type=float, default=None,
+                        help="Geographic filter: northern latitude bound (e.g. 55.0 for China region)")
+    parser.add_argument("--ssl4eo-lon-min", type=float, default=None,
+                        help="Geographic filter: western longitude bound (e.g. 90.0 for China region)")
+    parser.add_argument("--ssl4eo-lon-max", type=float, default=None,
+                        help="Geographic filter: eastern longitude bound (e.g. 135.0 for China region)")
+
     args = parser.parse_args()
 
     cfg = Config(
@@ -609,6 +760,11 @@ def parse_args() -> Config:
         iou_pos_threshold=args.iou_pos_threshold,
         wandb_project=args.wandb_project,
         wandb_run_name=args.wandb_run_name,
+        ssl4eo_root=args.ssl4eo_root,
+        ssl4eo_lat_min=args.ssl4eo_lat_min,
+        ssl4eo_lat_max=args.ssl4eo_lat_max,
+        ssl4eo_lon_min=args.ssl4eo_lon_min,
+        ssl4eo_lon_max=args.ssl4eo_lon_max,
     )
     return cfg
 
@@ -621,14 +777,20 @@ def main():
         cfg.visloc_root = os.environ["VISLOC_ROOT"]
 
     print("=" * 80)
-    print("Self-Supervised DINOv3 on VisLoc (satellite chunks only)")
+    print("Self-Supervised DINOv3 on VisLoc (SSL4EO-S12 satellite patches)")
     print(f"Model: {cfg.model_name}")
-    print(f"Train flights: {TRAIN_FLIGHTS}")
-    print(f"Val flight: {VAL_FLIGHT}")
-    print(f"Satellite scales: {SAT_SCALES}")
-    print(f"Training stride: {TRAIN_STRIDE} (eval stride: {CHUNK_STRIDE})")
+    print(f"SSL4EO-S12 root: {cfg.ssl4eo_root}")
+    ssl4eo_shard_dir = Path(cfg.ssl4eo_root) / "train" / "S2RGB"
+    n_shards = len(list(ssl4eo_shard_dir.glob("*.tar"))) if ssl4eo_shard_dir.exists() else 0
+    geo_filter = (
+        f"lat [{cfg.ssl4eo_lat_min}, {cfg.ssl4eo_lat_max}], "
+        f"lon [{cfg.ssl4eo_lon_min}, {cfg.ssl4eo_lon_max}]"
+        if cfg.ssl4eo_lat_min is not None else "global (no filter)"
+    )
+    print(f"SSL4EO-S12 shards: {n_shards}  |  geo filter: {geo_filter}")
+    print(f"Val flight: {VAL_FLIGHT} (VisLoc UAV queries → satellite gallery)")
     print(f"LoRA rank={cfg.lora_rank}, alpha={cfg.lora_alpha}")
-    print(f"Data root: {cfg.visloc_root}")
+    print(f"VisLoc root: {cfg.visloc_root}")
     print(
         f"Train config: batch_size={cfg.batch_size}, eval_batch_size={cfg.eval_batch_size},"
         f" num_workers={cfg.num_workers}, max_epochs={cfg.max_epochs}"

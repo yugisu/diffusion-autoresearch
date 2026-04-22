@@ -18,6 +18,14 @@ dependencies = [
     "accelerate==0.34.2",
     "lightning>=2.2.0",
     "wandb>=0.17.0",
+    "ipykernel>=7.2.0",
+    "zarr>=2.18.3",
+    "fsspec>=2026.2.0",
+    "webdataset>=1.0.2",
+    "braceexpand>=0.1.7",
+    "einops>=0.8.2",
+    "albumentations>=2.0.8",
+    "pyarrow>=24.0.0",
 ]
 
 [tool.uv.sources]

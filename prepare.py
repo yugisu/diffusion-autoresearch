@@ -21,6 +21,7 @@ from torch.utils.data import Dataset
 # ---------------------------------------------------------------------------
 
 VISLOC_ROOT = Path("/workspace/data/visloc")
+SSL4EOS12_ROOT = Path("/workspace/data/SSL4EOS12")
 HF_HOME = "/workspace/.hugging_face"
 FLIGHT_ID = "03"
 TIME_BUDGET = 2700  # seconds (45 minutes wall-clock budget per experiment)
@@ -230,10 +231,11 @@ def evaluate_r1(
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    print(f"VISLOC_ROOT : {VISLOC_ROOT}")
-    print(f"HF_HOME     : {HF_HOME}")
-    print(f"FLIGHT_ID   : {FLIGHT_ID}")
-    print(f"TIME_BUDGET : {TIME_BUDGET}s")
+    print(f"VISLOC_ROOT    : {VISLOC_ROOT}")
+    print(f"SSL4EOS12_ROOT : {SSL4EOS12_ROOT}")
+    print(f"HF_HOME        : {HF_HOME}")
+    print(f"FLIGHT_ID      : {FLIGHT_ID}")
+    print(f"TIME_BUDGET    : {TIME_BUDGET}s")
     print()
 
     print("Loading UAV dataset...")
