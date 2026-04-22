@@ -6,11 +6,13 @@ Backbone: loaded from SSL Exp13 checkpoint (LoRA merged into weights), then full
 Training: multi-positive InfoNCE + GPS proximity mask + TwoFlightBatchSampler
           + CosineAnnealingWarmRestarts T_0=10 epochs (2 cycles) + grad clip 1.0 + head lr=2e-5.
 
-exp5 changes vs exp3:
-  - 3-flight batch sampling: each batch draws from 3 geographic regions (was 2).
-    ~21 samples per flight in a 64-sample batch vs ~32. More geographically diverse
-    negatives per batch — directly targets the R@1 ranking precision gap.
-  - 4-tier LLRD (5e-6/1e-5/1.5e-5/2e-5) in isolation from exp4 (no aug change).
+exp6 changes vs exp5:
+  - max_epochs=30 (was 20): gives cycle-2 proper room after T_0=15 restart.
+  - T_0=15 epochs (was 10): 2 cycles in 30 epochs. Exp5 peaked at epoch 5 then early-
+    stopped at epoch 11 — cycle-2 restart at epoch 10 had only 1 epoch before stopping.
+    Longer schedule lets cycle-2 (epochs 15-30) fully develop.
+  - EarlyStopping patience=10 (was 6): prevents premature termination across the restart.
+  - 3-flight sampling + 4-tier LLRD retained from exp5.
 
 SSL checkpoint:  checkpoints/dinov3-ssl-best-r@1=0.53-e656447.ckpt
 Supervised baseline: R@1 = 73.6% (Exp16, trained from pretrained DINOv3)
@@ -174,7 +176,7 @@ class Config:
     weight_decay: float = 1e-4
     temperature: float = 0.07
 
-    max_epochs: int = 20
+    max_epochs: int = 30
     max_steps: int = -1
     precision: str = "16-mixed"
     seed: int = 42
@@ -499,7 +501,7 @@ class DinoCrossViewRetrieverST2(pl.LightningModule):
         optimizer = AdamW(param_groups, weight_decay=self.cfg.weight_decay)
 
         train_batches = max(len(self.trainer.datamodule.train_dataloader()), 1)
-        T_0 = 10 * train_batches  # 2 cycles over 20 epochs instead of 4; eliminates destructive late restarts
+        T_0 = 15 * train_batches  # 2 cycles over 30 epochs; gives cycle-2 full room after exp5 early-stopped at epoch 11
         scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=T_0, T_mult=1, eta_min=2e-5 * 0.05)
         return {
             "optimizer": optimizer,
@@ -592,7 +594,7 @@ def main():
         mode="max",
         save_top_k=1,
     )
-    early_stop_cb = EarlyStopping(monitor="val/R@1", mode="max", patience=6)
+    early_stop_cb = EarlyStopping(monitor="val/R@1", mode="max", patience=10)
 
     trainer = pl.Trainer(
         accelerator="auto",
