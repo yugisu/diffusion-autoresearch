@@ -4,7 +4,7 @@ Stage-2 supervised fine-tuning on top of the best SSL checkpoint.
 Backbone: loaded from SSL Exp13 checkpoint (LoRA merged into weights), then fully
           unfrozen with the same LLRD as supervised Exp16.
 Training: multi-positive InfoNCE + GPS proximity mask + TwoFlightBatchSampler
-          + CosineAnnealingWarmRestarts — identical to supervised Exp16 recipe.
+          + 2-epoch linear warmup + plain CosineAnnealingLR (no restarts) + grad clip 1.0.
 
 SSL checkpoint:  checkpoints/dinov3-ssl-best-r@1=0.53-e656447.ckpt
 Supervised baseline: R@1 = 73.6% (Exp16, trained from pretrained DINOv3)
@@ -35,7 +35,7 @@ import torch.nn.functional as F
 from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint
 from lightning.pytorch.loggers import WandbLogger
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 from transformers import AutoImageProcessor, AutoModel
@@ -490,8 +490,13 @@ class DinoCrossViewRetrieverST2(pl.LightningModule):
         optimizer = AdamW(param_groups, weight_decay=self.cfg.weight_decay)
 
         train_batches = max(len(self.trainer.datamodule.train_dataloader()), 1)
-        T_0 = 5 * train_batches
-        scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=T_0, T_mult=1, eta_min=2e-5 * 0.05)
+        warmup_steps = 2 * train_batches
+        total_steps = self.cfg.max_epochs * train_batches
+
+        warmup = LinearLR(optimizer, start_factor=0.1, end_factor=1.0, total_iters=warmup_steps)
+        cosine = CosineAnnealingLR(optimizer, T_max=total_steps - warmup_steps, eta_min=1e-7)
+        scheduler = SequentialLR(optimizer, schedulers=[warmup, cosine], milestones=[warmup_steps])
+
         return {
             "optimizer": optimizer,
             "lr_scheduler": {"scheduler": scheduler, "interval": "step"},
@@ -595,6 +600,7 @@ def main():
         callbacks=[ckpt_cb, early_stop_cb],
         log_every_n_steps=5,
         benchmark=True,
+        gradient_clip_val=1.0,
     )
 
     trainer.fit(model, datamodule=datamodule)
