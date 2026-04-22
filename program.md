@@ -55,27 +55,26 @@ sat_scales = {"01": 0.25,"02": 0.25,"03": 0.25,"04": 0.25,"05": 0.4,"06": 0.6,"0
 - Evaluation uses the fixed `evaluate_r1` from `prepare.py` on flight 03: 768 UAV queries against 2860 satellite chunks.
 - Satellite TTA (averaging embeddings over 0/90/180/270° rotations) may be used at evaluation.
 
-### Experiment plan (execute in order)
+### Experiment plan
 
-Training experiments are conducted **strictly in the given order**. Step 6 unlocks freedom for exploration based on winners from previous experiments.
+All experiments use SSL4EO-S12 S2RGB as the base training corpus unless stated otherwise. The canonical SSL pair is: two different seasonal timestamps of the same geographic location, anchor with strong scale crop (simulating UAV zoom), positive with mild crop and satellite-like quality degradation.
 
-All experiments use SSL4EO-S12 S2RGB as the base training corpus unless stated otherwise. The canonical SSL pair is: two different seasonal timestamps of the same geographic location, anchor with strong augmentation, positive with mild augmentation.
+Explore freely — there is no prescribed order. Design experiments based on what has worked so far, what hasn't, and the research context below. Promising directions include:
 
-1. **InfoNCE baseline (global data)**: InfoNCE with SSL4EO-S12, all 244K global locations, no geographic filter. Seasonal timestamp pairs as positives, in-batch negatives. Default config: batch=128, lr=1e-5, LoRA last-4-blocks, max_epochs=13.
-2. **China-region filter**: Restrict training data to lat 15–55 / lon 90–135 (~21K samples matching VisLoc flight regions). Compare against Exp1 — more domain-relevant vs less data. Use `--ssl4eo-lat-min 15 --ssl4eo-lat-max 55 --ssl4eo-lon-min 90 --ssl4eo-lon-max 135`.
-3. **GeoRank regularization**: Add `georank_weight=0.1` to the best of Exp1/2. GeoRank ties embedding similarity ranks to geographic distance ranks (Burgert et al., WACV 2025).
-4. **VICReg objective**: Swap InfoNCE for VICReg (variance–invariance–covariance regularization). May avoid false-negative issues inherent to in-batch contrastive when seasonal pairs have visually similar negatives.
-5. **VisLoc satellite chunks mixed in**: Add satellite chunks from all VisLoc flights (stride=64) alongside SSL4EO-S12 to the training pool. This lets the model learn the exact visual domain of the evaluation region. Not cheating — no UAV images or GPS labels used.
-6. **Free experimentation**: Try combinations of what worked from experiments 1-5, tune hyperparameters, try alternative sampling strategies. Explore and exploit.
-7. **Canny reconstruction** (optional): Add a Canny edge reconstruction objective — the model predicts a Canny-filtered version of the input image. Goal is to learn edge/structure features that transfer across the UAV-satellite domain gap.
-8. **DINO self-distillation** (optional, if R@1 < 0.50 after experiments 1-6): Teacher-student setup. Init both from pretrained DINOv3 weights. Teacher is EMA of student (momentum 0.996→1.0 cosine schedule). Student sees local crops, teacher sees global crops. Standard DINO continued pretraining — no architectural novelty needed. **Budget: 4 hours** (DINO requires multi-crop which is compute-intensive).
+- **InfoNCE with geographic filters**: global (244K samples) vs. China region lat 15–55 / lon 90–135 (~21K samples, closer to VisLoc flight regions). Use `--ssl4eo-lat-min 15 --ssl4eo-lat-max 55 --ssl4eo-lon-min 90 --ssl4eo-lon-max 135`.
+- **GeoRank regularization**: `georank_weight=0.1` — ties embedding similarity ranks to geographic distance ranks (Burgert et al., WACV 2025).
+- **VICReg objective**: swap InfoNCE for VICReg (variance–invariance–covariance). Avoids false-negative issues when seasonal pairs look similar.
+- **VisLoc satellite chunks mixed in**: add satellite chunks from all VisLoc flights (stride=64) alongside SSL4EO-S12. Teaches the exact visual domain of the evaluation region. Not cheating — no UAV images or GPS labels.
+- **Augmentation tuning**: adjust anchor/positive quality gap, crop scales, blur intensity.
+- **Hyperparameter search**: batch size, LR, LoRA rank/coverage, temperature.
+- **DINO self-distillation** (if R@1 < 0.50 after several experiments): teacher-student setup, EMA momentum 0.996→1.0, student sees local crops, teacher sees global crops. **Budget: 4 hours**.
 
 ### Training notes
 
 - **SSL4EO-S12 data loading**: `build_ssl4eo_ssl_pipeline` in `train.py` reads `train_metadata.parquet` to pre-filter shards by lat/lon, then does a per-sample secondary filter inside each shard (shards have global mixing). Batching is done inside the pipeline (webdataset `.batched()`), so the DataLoader uses `batch_size=None`.
 - **Seasonal pairs**: Each SSL4EO-S12 sample has 4 seasonal timestamps (Spring/Summer/Autumn/Winter). Two timestamps are sampled without replacement per forward pass; t1 → anchor (strong aug), t2 → positive (mild aug). This teaches temporal/seasonal invariance on top of scale invariance.
 - **Training data stride for VisLoc chunks** (if added): Use stride_pixels=64 for training satellite chunks (4× denser than default). Eval stride stays at the default from prepare.py.
-- **Augmentation guidance**: Geometric/scale augmentations (flips, 90° rotations, random resized crop) perform better than color augmentations for satellite SSL. Include slight brightness and contrast jitter (`ColorJitter(brightness=0.3, contrast=0.3, saturation=0, hue=0)`) to simulate weather conditions without altering spectral relationships. Avoid hue/saturation jitter.
+- **Augmentation guidance**: UAV images are **higher quality and higher resolution** than satellite imagery — treat them as the clean reference. Anchor (UAV-like) = strong geometric crop (25–50% scale, simulating zoomed-in UAV perspective) with minimal quality degradation: only slight brightness/contrast jitter, no blur, no grayscale. Positive (satellite-like) = mild crop (75–100% scale) with quality degradation: GaussianBlur to simulate lower satellite resolution, moderate brightness/contrast jitter for weather/temporal variation. Avoid hue/saturation jitter on both — it alters spectral relationships.
 - **Logging**: Track total samples seen by the model, log LR, elapsed time × samples, and elapsed time × optimizer step metrics. Attach `run.log` to wandb as an artifact.
 - **Initial max_epochs**: 13 (inherited from previous best run). Agent can adjust freely if experiments justify it.
 
@@ -179,12 +178,10 @@ The experiments loop is conducted on a powerful machine that has an A100 GPU wit
 
 The experiment runs on a dedicated branch (agreed during setup).
 
-Follow the **experiment plan in order** (steps 1-8 above). Within each step, you may run multiple sub-experiments (e.g. trying different hyperparameters for InfoNCE in step 1). Step 6 unlocks free experimentation.
-
 LOOP:
 
 1. Look at git state: current branch/commit.
-2. Implement the next experiment from the plan by modifying `train.py`.
+2. Design and implement the next experiment by modifying `train.py`. Draw on prior findings, the research context, and promising directions listed above.
 3. git commit with a descriptive message.
 4. Run experiment: `uv run train.py > run.log 2>&1` (redirect everything — do NOT use tee or let output flood your context)
 5. Read out results from `run.log`.

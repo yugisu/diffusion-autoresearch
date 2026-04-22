@@ -5,7 +5,8 @@ Branch goal:
 - Fine-tune facebook/dinov3-vitb16-pretrain-lvd1689m with self-supervised learning
 - Train on SSL4EO-S12 S2RGB satellite patches (244K global locations × 4 seasons)
 - SSL pairs: two seasonal timestamps of the same location
-  anchor = strong crop+jitter (UAV-like), positive = mild crop (satellite-like)
+  anchor = zoomed-in crop (UAV-like scale, minimal quality degradation — UAV is higher quality)
+  positive = full-scale crop with quality degradation (blur + jitter — satellite is lower quality)
 - Validate on flight: 03 (768 UAV queries, 2860 satellite chunks)
 - Optimize for Recall@1 on fixed VisLoc evaluation
 - No UAV images during training
@@ -287,8 +288,8 @@ def build_ssl4eo_ssl_pipeline(
     minority of samples that fall outside the box (shards have global mixing).
 
     Each decoded sample yields an (anchor, positive, coords, coords) tuple:
-      anchor   — seasonal view t1 with strong crop+jitter augmentation
-      positive — seasonal view t2 (different season) with mild augmentation
+      anchor   — seasonal view t1, zoomed-in crop (UAV-like), minimal quality degradation
+      positive — seasonal view t2 (different season), full-scale crop with blur+jitter (satellite-like)
 
     The pipeline handles its own batching via .batched(), so the DataLoader
     should be created with batch_size=None.
@@ -378,18 +379,19 @@ class VisLocSSLDataModule(pl.LightningDataModule):
             transforms.ToTensor(),
             transforms.Normalize(mean=mean, std=std),
         ]
-        # Anchor: zoomed-in UAV-like crop + stronger sensor/temporal augmentation
+        # Anchor: zoomed-in UAV-like crop — UAV is HIGH quality, so keep clean
+        # Only geometric variation; slight brightness/contrast for robustness
         anchor_aug = [
             transforms.RandomResizedCrop(cfg.image_size, scale=(0.25, 0.50), ratio=(0.9, 1.1)),
-            transforms.ColorJitter(brightness=0.5, contrast=0.5, saturation=0.3, hue=0.1),
-            transforms.RandomGrayscale(p=0.1),
-            transforms.GaussianBlur(kernel_size=9, sigma=(0.1, 2.0)),
+            transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0, hue=0),
         ]
         self.anchor_transform = transforms.Compose(anchor_aug + shared_aug)
-        # Positive: full-scale satellite view — mild augmentation only
+        # Positive: full-scale satellite view — satellite is LOWER quality, apply degradation
+        # Blur simulates lower satellite resolution; stronger jitter for weather/temporal variation
         self.positive_transform = transforms.Compose([
             transforms.RandomResizedCrop(cfg.image_size, scale=(0.75, 1.00), ratio=(0.9, 1.1)),
-            transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0, hue=0),
+            transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0, hue=0),
+            transforms.GaussianBlur(kernel_size=9, sigma=(0.5, 2.0)),
         ] + shared_aug)
         # Kept for eval (not used for training)
         self.train_transform = self.anchor_transform
