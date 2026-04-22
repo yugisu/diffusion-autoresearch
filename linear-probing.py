@@ -15,6 +15,8 @@ Environment (optional overrides):
 """
 
 from __future__ import annotations
+from src.losses import georank_loss
+from src.utils import batched_iou
 
 import argparse
 import os
@@ -104,14 +106,14 @@ class Config:
     max_epochs: int = 7
     warmup_epochs: int = 1
     batch_size: int = 128
-    lr: float = 5e-6
+    lr: float = 5e-5
     weight_decay: float = 1e-4
-    cosine_t0: int = 0  # CosineAnnealingWarmRestarts period (0 = single cycle = plain cosine)
+    cosine_t0: int = 0  # 0 = plain cosine, no restarts
     llrd_decay: float = 0.6  # per-block LR decay: block[n-1] gets lr*decay, block[n-2] gets lr*decay^2, ...
-    gradient_clip_val: float = 1.0
+    gradient_clip_val: float | None = None
 
-    contrastive_temperature: float = 0.07  # contrastive temperature
-    georank_weight: float = 20.0  # weight for GeoRank regularization (0 = disabled)
+    contrastive_temperature: float = 0.1  # contrastive temperature
+    georank_weight: float = 0.0  # weight for GeoRank regularization (0 = disabled)
     georank_temperature: float = (
         1.0  # sigmoid slope inside the soft rank - larger -> harder/sharper ranks (less gradient), smaller -> softer ranks
     )
@@ -121,49 +123,6 @@ class Config:
 
     iou_pos_threshold: float = 0.50  # unused
     iou_neg_threshold: float = 0.0  # off-diagonal pairs with IoU > this are masked out of InfoNCE negatives (0 = mask any overlap)
-
-
-# -----------------------------------------------------------------------------
-# Utils
-# -----------------------------------------------------------------------------
-
-
-def haversine_distance(lat1, lon1, lat2, lon2):
-    R = 6371.0
-    lat1, lon1, lat2, lon2 = map(lambda x: torch.deg2rad(x.float()), [lat1, lon1, lat2, lon2])
-    dlat = lat2.unsqueeze(0) - lat1.unsqueeze(1)
-    dlon = lon2.unsqueeze(0) - lon1.unsqueeze(1)
-    a = torch.sin(dlat / 2) ** 2 + (torch.cos(lat1.unsqueeze(1)) * torch.cos(lat2.unsqueeze(0)) * torch.sin(dlon / 2) ** 2)
-    return 2 * R * torch.asin(torch.clamp(torch.sqrt(a), 0, 1))
-
-
-def compute_iou(box_a: Tuple[float, ...], box_b: Tuple[float, ...]) -> float:
-    """Compute IoU between two (lat_min, lon_min, lat_max, lon_max) bboxes."""
-    lat_min = max(box_a[0], box_b[0])
-    lon_min = max(box_a[1], box_b[1])
-    lat_max = min(box_a[2], box_b[2])
-    lon_max = min(box_a[3], box_b[3])
-
-    if lat_min >= lat_max or lon_min >= lon_max:
-        return 0.0
-
-    inter = (lat_max - lat_min) * (lon_max - lon_min)
-    area_a = (box_a[2] - box_a[0]) * (box_a[3] - box_a[1])
-    area_b = (box_b[2] - box_b[0]) * (box_b[3] - box_b[1])
-    union = area_a + area_b - inter
-    return inter / union if union > 0 else 0.0
-
-
-def batched_iou(boxes: torch.Tensor) -> torch.Tensor:
-    """Pairwise IoU for a batch of (lat_min, lon_min, lat_max, lon_max) bboxes.
-    Returns (N, N) float tensor in [0, 1]."""
-    lat_min, lon_min, lat_max, lon_max = boxes.unbind(dim=-1)
-    inter_lat = (torch.minimum(lat_max[:, None], lat_max[None, :]) - torch.maximum(lat_min[:, None], lat_min[None, :])).clamp(min=0)
-    inter_lon = (torch.minimum(lon_max[:, None], lon_max[None, :]) - torch.maximum(lon_min[:, None], lon_min[None, :])).clamp(min=0)
-    inter = inter_lat * inter_lon
-    area = (lat_max - lat_min) * (lon_max - lon_min)
-    union = area[:, None] + area[None, :] - inter
-    return torch.where(union > 0, inter / union, torch.zeros_like(inter))
 
 
 # -----------------------------------------------------------------------------
@@ -242,29 +201,28 @@ class VisLocSSLDataModule(pl.LightningDataModule):
         mean = self.processor.image_mean
         std = self.processor.image_std
 
-        # _random_90 = transforms.Lambda(lambda img: TF.rotate(img, random.choice([0, 90, 180, 270])))
         shared_aug = [
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.RandomVerticalFlip(p=0.5),
             transforms.ToTensor(),
             transforms.Normalize(mean=mean, std=std),
         ]
         # Anchor: zoomed-in UAV-like crop + stronger sensor/temporal augmentation
-        self.anchor_transform = transforms.Compose([
-            transforms.RandomHorizontalFlip(p=0.5),
-            transforms.RandomVerticalFlip(p=0.5),
-            # non-aggressive zoom-in because SAT_SCALES are designed that way to roughly match UAV viewpoints.
-            transforms.RandomResizedCrop(cfg.image_size, scale=(0.25, 0.5), ratio=(0.9, 1.1)),
-            transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.2, hue=0.1),
-            *shared_aug,
-        ])
+        anchor_aug = [
+            transforms.RandomResizedCrop(cfg.image_size, scale=(0.25, 0.50), ratio=(0.9, 1.1)),
+            transforms.ColorJitter(brightness=0.5, contrast=0.5, saturation=0.3, hue=0.1),
+            transforms.RandomGrayscale(p=0.1),
+            transforms.GaussianBlur(kernel_size=9, sigma=(0.1, 2.0)),
+        ]
+        self.anchor_transform = transforms.Compose(anchor_aug + shared_aug)
         # Positive: full-scale satellite view — mild augmentation only
-        self.positive_transform = transforms.Compose([
-            transforms.RandomHorizontalFlip(p=0.5),
-            transforms.RandomVerticalFlip(p=0.5),
-            transforms.RandomResizedCrop(cfg.image_size, scale=(0.75, 1.00), ratio=(0.9, 1.1)),
-            transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0, hue=0),
-            *shared_aug,
-        ])
-
+        self.positive_transform = transforms.Compose(
+            [
+                transforms.RandomResizedCrop(cfg.image_size, scale=(0.75, 1.00), ratio=(0.9, 1.1)),
+                transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0, hue=0),
+            ]
+            + shared_aug
+        )
         # Kept for eval (not used for training)
         self.train_transform = self.anchor_transform
         self.eval_transform = transforms.Compose([
@@ -328,69 +286,6 @@ class VisLocSSLDataModule(pl.LightningDataModule):
 # -----------------------------------------------------------------------------
 
 
-def symnce_loss(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    temperature: float,
-    negative_mask: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """Symmetric InfoNCE: diagonal entries are positives. If ``negative_mask``
-    is provided (bool, (N, N)), True entries are excluded from the softmax
-    denominator in both directions. The diagonal must be False."""
-    logits = (q @ k.t()) / temperature
-    if negative_mask is not None:
-        logits = logits.masked_fill(negative_mask, float("-inf"))
-    labels = torch.arange(len(q), device=q.device)
-    loss_qk = F.cross_entropy(logits, labels)
-    loss_kq = F.cross_entropy(logits.t(), labels)
-    return 0.5 * (loss_qk + loss_kq)
-
-
-def georank_loss(
-    embeddings: torch.Tensor,  # (N, D), L2-normalized
-    lats: torch.Tensor,  # (N,) degrees
-    lons: torch.Tensor,  # (N,) degrees
-    regularization_strength: float = 1.0,
-) -> torch.Tensor:
-    """
-    GeoRank regularization term (Burgert et al., 2026, arXiv:2601.02289).
-
-    Minimizes the Spearman-like rank disagreement between pairwise
-    embedding distances and pairwise spherical geographic distances.
-
-    For each anchor i, soft-ranks all other samples by:
-      - embedding distance (cosine or L2)
-      - geographic (haversine) distance
-    Then penalizes the MSE between the two rank vectors.
-    """
-    N = embeddings.size(0)
-
-    emb_dist = 1.0 - embeddings @ embeddings.T  # (N, N)
-    geo_dist = haversine_distance(lats, lons, lats, lons)
-
-    # Mask diagonal with large value so self-distance ranks last
-    inf = torch.finfo(emb_dist.dtype).max
-    eye = torch.eye(N, dtype=torch.bool, device=embeddings.device)
-    emb_dist = emb_dist.masked_fill(eye, inf)
-    geo_dist = geo_dist.masked_fill(eye, inf)
-
-    # Differentiable soft rank: rank(x)[i] = 1 + Σⱼ σ((x[i]-x[j]) / strength)
-    # Applied per-row: diff[i,j,k] = x[i,j] - x[i,k], sum over k → rank of each j within row i
-    # Previous version: torchsort's soft_rank fn; didn't work because it doesn't support torch 2.3
-    def _soft_rank(x: torch.Tensor) -> torch.Tensor:
-        diff = x.unsqueeze(-1) - x.unsqueeze(-2)
-        return 1.0 + torch.sigmoid(diff * regularization_strength).sum(-1)
-
-    e_ranks = _soft_rank(emb_dist)
-    g_ranks = _soft_rank(geo_dist)
-
-    # Normalize to [0, 1]
-    e_ranks = e_ranks / N
-    g_ranks = g_ranks / N
-
-    return F.mse_loss(e_ranks, g_ranks)
-
-
 # -----------------------------------------------------------------------------
 # Lightning model
 # -----------------------------------------------------------------------------
@@ -403,10 +298,20 @@ class DinoSSLRetrieverSt1(pl.LightningModule):
         self.save_hyperparameters(vars(cfg))
 
         self.backbone = AutoModel.from_pretrained(cfg.model_name, trust_remote_code=True)
+        hidden = self.backbone.config.hidden_size
 
-        # Fully unfreeze all backbone blocks with LLRD
+        # Fully freeze backbone
         for param in self.backbone.parameters():
-            param.requires_grad = True
+            param.requires_grad = False
+
+        self.proj = nn.Sequential(
+            nn.Sequential(
+                nn.Linear(hidden, hidden),
+                nn.GELU(),
+                nn.Dropout(0.1),
+                nn.Linear(hidden, cfg.embedding_dim),
+            )
+        )
 
         self._ntxent_loss = losses.NTXentLoss(temperature=cfg.contrastive_temperature)
         self._ntxent_loss = losses.SelfSupervisedLoss(self._ntxent_loss)
@@ -421,7 +326,9 @@ class DinoSSLRetrieverSt1(pl.LightningModule):
         """Extract CLS token embedding."""
         out = self.backbone(pixel_values=x)
         cls = out.last_hidden_state[:, 0]
-        return F.normalize(cls, dim=-1)
+        emb = self.proj(cls)
+        emb = F.normalize(emb, dim=-1)
+        return emb
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.encode(x)
@@ -436,15 +343,6 @@ class DinoSSLRetrieverSt1(pl.LightningModule):
         k = self.encode(positive)
 
         q_ssl, k_ssl = q, k
-
-        # Don't treat spatially-overlapping chunks as negatives: with stride=128
-        # and chunk=512, neighbouring chunks overlap ~75% and are near-duplicates.
-        iou = batched_iou(bboxes)
-        eye = torch.eye(bboxes.size(0), dtype=torch.bool, device=iou.device)
-        negative_mask = (iou > self.cfg.iou_neg_threshold) & ~eye
-
-        # infonce = symnce_loss(q_ssl, k_ssl, self.cfg.contrastive_temperature, negative_mask=negative_mask)
-        # self.log("train/symnce_loss", infonce, on_step=True, on_epoch=False)
 
         infonce = self._ntxent_loss(q_ssl, k_ssl)
         self.log("train/ntxent_loss", infonce, on_step=True, on_epoch=False)
@@ -511,24 +409,11 @@ class DinoSSLRetrieverSt1(pl.LightningModule):
         )
 
     def configure_optimizers(self):
-        # LLRD (per blocks)
-        early_params = [p for blk in self.backbone.layer[:4] for p in blk.parameters()]
-        early_params += list(self.backbone.embeddings.parameters())
-        mid_params = [p for blk in self.backbone.layer[4:8] for p in blk.parameters()]
-        late_params = [p for blk in self.backbone.layer[8:] for p in blk.parameters()]
-        late_params += list(self.backbone.norm.parameters())
+        head_params = list(self.proj.parameters())
 
         param_groups = [
-            {"params": early_params, "lr": self.cfg.lr * self.cfg.llrd_decay**2, "name": "early"},  # decay^2
-            {"params": mid_params, "lr": self.cfg.lr * self.cfg.llrd_decay, "name": "mid"},  # decay^1
-            {"params": late_params, "lr": self.cfg.lr, "name": "late"},  # decay^0
+            {"params": head_params, "lr": self.cfg.lr, "name": "head"},
         ]
-
-        # Sanity check all parameters are covered.
-        all_grouped = set(id(p) for g in param_groups for p in g["params"])
-        all_trainable = set(id(p) for p in self.backbone.parameters() if p.requires_grad)
-        missed = all_trainable - all_grouped
-        assert not missed, f"{len(missed)} backbone params not assigned to any LR group"
 
         # AdamW optimizer
         optimizer = AdamW(param_groups, weight_decay=self.cfg.weight_decay)

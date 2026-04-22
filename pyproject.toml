@@ -19,6 +19,8 @@ dependencies = [
     "lightning>=2.2.0",
     "wandb>=0.17.0",
     "pytorch-metric-learning>=2.9.0",
+    "ipykernel>=7.2.0",
+    "peft>=0.19.1",
 ]
 
 [tool.uv.sources]

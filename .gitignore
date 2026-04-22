@@ -23,7 +23,7 @@ dev/
 results.tsv
 
 # Experiment artifacts
-run.log
+*.log
 cache/
 
 .env

@@ -14,3 +14,13 @@ Debugging log:
 refactoring broke stuff, now model nosedives.
 
 symnce seems weird.
+
+full fine-tuning doesn't seem to be working well as it is very hyperparam sensitive.
+
+the model takes a nosedive in the process of training.
+
+### Linear probe (proj head)
+
+temperature=0.07 seems too easy, temperature=0.5 seems too hard
+
+### LoRA adapter

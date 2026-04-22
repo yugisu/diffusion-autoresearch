@@ -3,6 +3,8 @@ Self-supervised DINOv3 training for VisLoc cross-view retrieval.
 
 Branch goal:
 - Fine-tune facebook/dinov3-vitb16-pretrain-lvd1689m with self-supervised learning
+- Train on satellite chunks only from flights: 01, 02, 04, 05, 06, 08, 09, 10, 11
+- Validate on flight: 03 (768 UAV queries, 2860 satellite chunks)
 - Optimize for Recall@1 on fixed VisLoc evaluation
 - No UAV images during training — satellite chunks only
 
@@ -17,6 +19,7 @@ Environment (optional overrides):
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import random
 import time
@@ -29,17 +32,18 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torchvision.transforms.functional as TF
-from lightning.pytorch.callbacks import EarlyStopping, LearningRateMonitor, ModelCheckpoint
+from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint
 from lightning.pytorch.loggers import WandbLogger
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts, LinearLR, SequentialLR
+from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 from transformers import AutoImageProcessor, AutoModel
-from pytorch_metric_learning import losses
 
 from prepare import (
+    CHUNK_PIXELS,
+    CHUNK_STRIDE,
+    MAP_SCALE_FACTOR,
     VISLOC_ROOT,
     SatChunkDataset,
     UAVDataset,
@@ -54,12 +58,10 @@ torch.set_float32_matmul_precision("high")
 # -----------------------------------------------------------------------------
 
 DINO_MODEL = "facebook/dinov3-vitb16-pretrain-lvd1689m"
+TRAIN_FLIGHTS = ["01", "02", "03", "04", "05", "06", "08", "09", "10", "11"]  # 03 added: learn eval region structure
 VAL_FLIGHT = "03"
-TRAIN_FLIGHTS = ["01", "02", "03", "04", "05", "06", "08", "09", "10", "11"]  # val flight included: learn eval region structure
 
-CHUNK_PIXELS = 512
-CHUNK_STRIDE = 128
-TRAIN_STRIDE = 128  # Produce more chunks for training.
+TRAIN_STRIDE = 64  # denser stride for SSL training (~4x more chunks)
 
 SAT_SCALES = {
     "01": 0.25,
@@ -74,67 +76,110 @@ SAT_SCALES = {
     "11": 0.25,
 }
 
-TRAIN_SAT_SCALES = {
-    "01": 0.20,
-    "02": 0.20,
-    "03": 0.20,
-    "04": 0.20,
-    "05": 0.30,
-    "06": 0.45,
-    "08": 0.25,
-    "09": 0.20,
-    "10": 0.35,
-    "11": 0.20,
-}
-
 
 @dataclass
 class Config:
     visloc_root: str = str(VISLOC_ROOT)
     model_name: str = DINO_MODEL
-    embedding_dim: int = 768  # CLS token dim
-    precision: str = "16-mixed"
+    image_size: int = 336
+    embedding_dim: int = 768  # CLS token dim, no projection head
+
+    batch_size: int = 128
+    eval_batch_size: int = 128
     num_workers: int = 8
+
+    lr: float = 1e-5
+    weight_decay: float = 1e-4
+    temperature: float = 0.07
+    warmup_epochs: int = 2
+    proj_dim: int = 0  # projection head output dim (0 = disabled, use raw CLS for SSL)
+
+    georank_weight: float = 0.0  # weight for GeoRank regularization (0 = disabled)
+    cosine_t0: int = 0  # CosineAnnealingWarmRestarts period (0 = plain cosine decay)
+
+    lora_rank: int = 16
+    lora_alpha: float = 32.0
+    lora_last_n_blocks: int = 4  # only last N blocks get LoRA (0=all)
+
+    iou_pos_threshold: float = 0.50
+    iou_neg_threshold: float = 0.0  # IoU == 0 → negative
+
+    max_epochs: int = 13
+    max_steps: int = -1
+    precision: str = "16-mixed"
     seed: int = 42
 
-    eval_batch_size: int = 128
-
-    image_size: int = 336
-
-    max_epochs: int = 7
-    warmup_epochs: int = 1
-    batch_size: int = 128
-    lr: float = 5e-6
-    weight_decay: float = 1e-4
-    cosine_t0: int = 0  # CosineAnnealingWarmRestarts period (0 = single cycle = plain cosine)
-    llrd_decay: float = 0.6  # per-block LR decay: block[n-1] gets lr*decay, block[n-2] gets lr*decay^2, ...
-    gradient_clip_val: float = 1.0
-
-    contrastive_temperature: float = 0.07  # contrastive temperature
-    georank_weight: float = 20.0  # weight for GeoRank regularization (0 = disabled)
-    georank_temperature: float = (
-        1.0  # sigmoid slope inside the soft rank - larger -> harder/sharper ranks (less gradient), smaller -> softer ranks
-    )
-
-    wandb_project: str = "ssl-dinov3"
+    wandb_project: str = "autoresearch-ssl-dinov3"
     wandb_run_name: str | None = None
 
-    iou_pos_threshold: float = 0.50  # unused
-    iou_neg_threshold: float = 0.0  # off-diagonal pairs with IoU > this are masked out of InfoNCE negatives (0 = mask any overlap)
-
 
 # -----------------------------------------------------------------------------
-# Utils
+# LoRA implementation
 # -----------------------------------------------------------------------------
 
 
-def haversine_distance(lat1, lon1, lat2, lon2):
-    R = 6371.0
-    lat1, lon1, lat2, lon2 = map(lambda x: torch.deg2rad(x.float()), [lat1, lon1, lat2, lon2])
-    dlat = lat2.unsqueeze(0) - lat1.unsqueeze(1)
-    dlon = lon2.unsqueeze(0) - lon1.unsqueeze(1)
-    a = torch.sin(dlat / 2) ** 2 + (torch.cos(lat1.unsqueeze(1)) * torch.cos(lat2.unsqueeze(0)) * torch.sin(dlon / 2) ** 2)
-    return 2 * R * torch.asin(torch.clamp(torch.sqrt(a), 0, 1))
+class LoRALinear(nn.Module):
+    """Low-Rank Adaptation for nn.Linear layers."""
+
+    def __init__(self, orig: nn.Linear, rank: int = 16, alpha: float = 32.0):
+        super().__init__()
+        self.orig = orig
+        self.rank = rank
+        self.alpha = alpha
+        self.scaling = alpha / rank
+
+        # Freeze original weights
+        for p in self.orig.parameters():
+            p.requires_grad = False
+
+        # LoRA matrices
+        self.lora_A = nn.Parameter(torch.zeros(rank, orig.in_features))
+        self.lora_B = nn.Parameter(torch.zeros(orig.out_features, rank))
+        nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
+        # B initialized to zero so LoRA starts as identity
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        base = self.orig(x)
+        lora = (x @ self.lora_A.t()) @ self.lora_B.t() * self.scaling
+        return base + lora
+
+
+def apply_lora(model: nn.Module, rank: int = 16, alpha: float = 32.0, last_n_blocks: int = 0) -> nn.Module:
+    """Apply LoRA to qkv projection layers in the ViT backbone.
+
+    last_n_blocks: if >0, only apply LoRA to the last N transformer blocks (0 = all blocks).
+    """
+    for name, module in model.named_modules():
+        if not (isinstance(module, nn.Linear) and any(k in name for k in ("query", "key", "value", "qkv", "q_proj", "k_proj", "v_proj"))):
+            continue
+
+        if last_n_blocks > 0:
+            # Extract block index from name (e.g. "encoder.layer.10.attention...")
+            parts = name.split(".")
+            block_indices = [int(p) for p in parts if p.isdigit()]
+            if not block_indices:
+                continue
+            block_idx = block_indices[0]
+            # Count total blocks to determine cutoff
+            total_blocks = sum(1 for n, _ in model.named_modules() if n.endswith(".layernorm_before") or n.endswith(".layer_norm1"))
+            if total_blocks == 0:
+                total_blocks = 12  # ViT-B default
+            if block_idx < total_blocks - last_n_blocks:
+                continue
+
+        parent_name = ".".join(name.split(".")[:-1])
+        attr_name = name.split(".")[-1]
+        parent = model
+        for part in parent_name.split("."):
+            if part:
+                parent = getattr(parent, part)
+        setattr(parent, attr_name, LoRALinear(getattr(parent, attr_name), rank, alpha))
+    return model
+
+
+# -----------------------------------------------------------------------------
+# SSL Dataset — satellite chunks only, IoU-based positive mining
+# -----------------------------------------------------------------------------
 
 
 def compute_iou(box_a: Tuple[float, ...], box_b: Tuple[float, ...]) -> float:
@@ -154,23 +199,6 @@ def compute_iou(box_a: Tuple[float, ...], box_b: Tuple[float, ...]) -> float:
     return inter / union if union > 0 else 0.0
 
 
-def batched_iou(boxes: torch.Tensor) -> torch.Tensor:
-    """Pairwise IoU for a batch of (lat_min, lon_min, lat_max, lon_max) bboxes.
-    Returns (N, N) float tensor in [0, 1]."""
-    lat_min, lon_min, lat_max, lon_max = boxes.unbind(dim=-1)
-    inter_lat = (torch.minimum(lat_max[:, None], lat_max[None, :]) - torch.maximum(lat_min[:, None], lat_min[None, :])).clamp(min=0)
-    inter_lon = (torch.minimum(lon_max[:, None], lon_max[None, :]) - torch.maximum(lon_min[:, None], lon_min[None, :])).clamp(min=0)
-    inter = inter_lat * inter_lon
-    area = (lat_max - lat_min) * (lon_max - lon_min)
-    union = area[:, None] + area[None, :] - inter
-    return torch.where(union > 0, inter / union, torch.zeros_like(inter))
-
-
-# -----------------------------------------------------------------------------
-# SSL Dataset — satellite chunks only, IoU-based positive mining
-# -----------------------------------------------------------------------------
-
-
 class SatSSLDataset(Dataset):
     """
     Cross-scale SSL dataset: anchor = zoomed-in crop (25-50% of chunk area),
@@ -180,7 +208,7 @@ class SatSSLDataset(Dataset):
 
     def __init__(
         self,
-        root: Path,
+        root: str,
         flights: List[str],
         sat_scales: Dict[str, float],
         anchor_transform,
@@ -193,7 +221,7 @@ class SatSSLDataset(Dataset):
         self.samples: List[Tuple[str, int]] = []
 
         for flight in flights:
-            scale = sat_scales[flight]
+            scale = sat_scales.get(flight, MAP_SCALE_FACTOR)
             sat_ds = SatChunkDataset(
                 root,
                 flight,
@@ -210,7 +238,7 @@ class SatSSLDataset(Dataset):
     def __len__(self) -> int:
         return len(self.samples)
 
-    def __getitem__(self, idx: int):  # ty:ignore[invalid-method-override]
+    def __getitem__(self, idx: int):
         flight, chunk_idx = self.samples[idx]
         sat_ds = self.sat_datasets[flight]
         img, lat, lon = sat_ds[chunk_idx]
@@ -219,8 +247,7 @@ class SatSSLDataset(Dataset):
         positive = self.positive_transform(img)  # full-scale view (satellite-like)
 
         coords = torch.tensor([lat, lon], dtype=torch.float32)
-        bbox = torch.tensor(sat_ds.chunk_bboxes[chunk_idx], dtype=torch.float32)
-        return anchor, positive, coords, coords, bbox
+        return anchor, positive, coords, coords
 
 
 # -----------------------------------------------------------------------------
@@ -242,29 +269,28 @@ class VisLocSSLDataModule(pl.LightningDataModule):
         mean = self.processor.image_mean
         std = self.processor.image_std
 
-        # _random_90 = transforms.Lambda(lambda img: TF.rotate(img, random.choice([0, 90, 180, 270])))
         shared_aug = [
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.RandomVerticalFlip(p=0.5),
             transforms.ToTensor(),
             transforms.Normalize(mean=mean, std=std),
         ]
         # Anchor: zoomed-in UAV-like crop + stronger sensor/temporal augmentation
-        self.anchor_transform = transforms.Compose([
-            transforms.RandomHorizontalFlip(p=0.5),
-            transforms.RandomVerticalFlip(p=0.5),
-            # non-aggressive zoom-in because SAT_SCALES are designed that way to roughly match UAV viewpoints.
-            transforms.RandomResizedCrop(cfg.image_size, scale=(0.25, 0.5), ratio=(0.9, 1.1)),
-            transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.2, hue=0.1),
-            *shared_aug,
-        ])
+        anchor_aug = [
+            transforms.RandomResizedCrop(cfg.image_size, scale=(0.25, 0.50), ratio=(0.9, 1.1)),
+            transforms.ColorJitter(brightness=0.5, contrast=0.5, saturation=0.3, hue=0.1),
+            transforms.RandomGrayscale(p=0.1),
+            transforms.GaussianBlur(kernel_size=9, sigma=(0.1, 2.0)),
+        ]
+        self.anchor_transform = transforms.Compose(anchor_aug + shared_aug)
         # Positive: full-scale satellite view — mild augmentation only
-        self.positive_transform = transforms.Compose([
-            transforms.RandomHorizontalFlip(p=0.5),
-            transforms.RandomVerticalFlip(p=0.5),
-            transforms.RandomResizedCrop(cfg.image_size, scale=(0.75, 1.00), ratio=(0.9, 1.1)),
-            transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0, hue=0),
-            *shared_aug,
-        ])
-
+        self.positive_transform = transforms.Compose(
+            [
+                transforms.RandomResizedCrop(cfg.image_size, scale=(0.75, 1.00), ratio=(0.9, 1.1)),
+                transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0, hue=0),
+            ]
+            + shared_aug
+        )
         # Kept for eval (not used for training)
         self.train_transform = self.anchor_transform
         self.eval_transform = transforms.Compose([
@@ -278,14 +304,14 @@ class VisLocSSLDataModule(pl.LightningDataModule):
             self.train_ds = SatSSLDataset(
                 root=self.root,
                 flights=TRAIN_FLIGHTS,
-                sat_scales=TRAIN_SAT_SCALES,
+                sat_scales=SAT_SCALES,
                 anchor_transform=self.anchor_transform,
                 positive_transform=self.positive_transform,
                 iou_pos_threshold=self.cfg.iou_pos_threshold,
             )
 
         if self.val_uav_ds is None or self.val_sat_ds is None:
-            val_scale = SAT_SCALES[VAL_FLIGHT]
+            val_scale = SAT_SCALES.get(VAL_FLIGHT, MAP_SCALE_FACTOR)
             self.val_uav_ds = UAVDataset(self.root, VAL_FLIGHT, transform=self.eval_transform)
             self.val_sat_ds = SatChunkDataset(
                 self.root,
@@ -324,71 +350,24 @@ class VisLocSSLDataModule(pl.LightningDataModule):
 
 
 # -----------------------------------------------------------------------------
-# Losses
+# Projection head
 # -----------------------------------------------------------------------------
 
 
-def symnce_loss(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    temperature: float,
-    negative_mask: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """Symmetric InfoNCE: diagonal entries are positives. If ``negative_mask``
-    is provided (bool, (N, N)), True entries are excluded from the softmax
-    denominator in both directions. The diagonal must be False."""
-    logits = (q @ k.t()) / temperature
-    if negative_mask is not None:
-        logits = logits.masked_fill(negative_mask, float("-inf"))
-    labels = torch.arange(len(q), device=q.device)
-    loss_qk = F.cross_entropy(logits, labels)
-    loss_kq = F.cross_entropy(logits.t(), labels)
-    return 0.5 * (loss_qk + loss_kq)
+class ProjectionHead(nn.Module):
+    """2-layer MLP projection head used only during SSL training (discarded at eval)."""
 
+    def __init__(self, in_dim: int, out_dim: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, in_dim),
+            nn.BatchNorm1d(in_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(in_dim, out_dim),
+        )
 
-def georank_loss(
-    embeddings: torch.Tensor,  # (N, D), L2-normalized
-    lats: torch.Tensor,  # (N,) degrees
-    lons: torch.Tensor,  # (N,) degrees
-    regularization_strength: float = 1.0,
-) -> torch.Tensor:
-    """
-    GeoRank regularization term (Burgert et al., 2026, arXiv:2601.02289).
-
-    Minimizes the Spearman-like rank disagreement between pairwise
-    embedding distances and pairwise spherical geographic distances.
-
-    For each anchor i, soft-ranks all other samples by:
-      - embedding distance (cosine or L2)
-      - geographic (haversine) distance
-    Then penalizes the MSE between the two rank vectors.
-    """
-    N = embeddings.size(0)
-
-    emb_dist = 1.0 - embeddings @ embeddings.T  # (N, N)
-    geo_dist = haversine_distance(lats, lons, lats, lons)
-
-    # Mask diagonal with large value so self-distance ranks last
-    inf = torch.finfo(emb_dist.dtype).max
-    eye = torch.eye(N, dtype=torch.bool, device=embeddings.device)
-    emb_dist = emb_dist.masked_fill(eye, inf)
-    geo_dist = geo_dist.masked_fill(eye, inf)
-
-    # Differentiable soft rank: rank(x)[i] = 1 + Σⱼ σ((x[i]-x[j]) / strength)
-    # Applied per-row: diff[i,j,k] = x[i,j] - x[i,k], sum over k → rank of each j within row i
-    # Previous version: torchsort's soft_rank fn; didn't work because it doesn't support torch 2.3
-    def _soft_rank(x: torch.Tensor) -> torch.Tensor:
-        diff = x.unsqueeze(-1) - x.unsqueeze(-2)
-        return 1.0 + torch.sigmoid(diff * regularization_strength).sum(-1)
-
-    e_ranks = _soft_rank(emb_dist)
-    g_ranks = _soft_rank(geo_dist)
-
-    # Normalize to [0, 1]
-    e_ranks = e_ranks / N
-    g_ranks = g_ranks / N
-
-    return F.mse_loss(e_ranks, g_ranks)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return F.normalize(self.net(x), dim=-1)
 
 
 # -----------------------------------------------------------------------------
@@ -396,7 +375,7 @@ def georank_loss(
 # -----------------------------------------------------------------------------
 
 
-class DinoSSLRetrieverSt1(pl.LightningModule):
+class DinoSSLRetriever(pl.LightningModule):
     def __init__(self, cfg: Config):
         super().__init__()
         self.cfg = cfg
@@ -404,12 +383,15 @@ class DinoSSLRetrieverSt1(pl.LightningModule):
 
         self.backbone = AutoModel.from_pretrained(cfg.model_name, trust_remote_code=True)
 
-        # Fully unfreeze all backbone blocks with LLRD
+        # Freeze backbone, then apply LoRA
         for param in self.backbone.parameters():
-            param.requires_grad = True
+            param.requires_grad = False
+        self.backbone = apply_lora(self.backbone, rank=cfg.lora_rank, alpha=cfg.lora_alpha, last_n_blocks=cfg.lora_last_n_blocks)
 
-        self._ntxent_loss = losses.NTXentLoss(temperature=cfg.contrastive_temperature)
-        self._ntxent_loss = losses.SelfSupervisedLoss(self._ntxent_loss)
+        if cfg.proj_dim > 0:
+            self.proj_head = ProjectionHead(cfg.embedding_dim, cfg.proj_dim)
+        else:
+            self.proj_head = None
 
         self._val_uav_embs = []
         self._val_sat_embs = []
@@ -418,7 +400,7 @@ class DinoSSLRetrieverSt1(pl.LightningModule):
         self._train_start_time = None
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
-        """Extract CLS token embedding."""
+        """Extract CLS token embedding (768-d, no projection head)."""
         out = self.backbone(pixel_values=x)
         cls = out.last_hidden_state[:, 0]
         return F.normalize(cls, dim=-1)
@@ -426,36 +408,60 @@ class DinoSSLRetrieverSt1(pl.LightningModule):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.encode(x)
 
+    def _infonce_loss(self, q: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
+        """Symmetric InfoNCE: diagonal entries are positives."""
+        logits = (q @ k.t()) / self.cfg.temperature
+        labels = torch.arange(len(q), device=q.device)
+        loss_qk = F.cross_entropy(logits, labels)
+        loss_kq = F.cross_entropy(logits.t(), labels)
+        return 0.5 * (loss_qk + loss_kq)
+
+    def _georank_loss(self, embs: torch.Tensor, coords: torch.Tensor) -> torch.Tensor:
+        """GeoRank: MSE between normalized geographic distance ranks and embedding similarity ranks.
+
+        Burgert et al. WACV 2025: rank-preservation regularization that ties embedding
+        space ordering to geographic ordering.
+        """
+        # Pairwise geographic distances (degrees, flat-earth approx)
+        dlat = coords[:, 0:1] - coords[:, 0:1].T
+        dlon = coords[:, 1:2] - coords[:, 1:2].T
+        geo_dist = torch.sqrt(dlat**2 + dlon**2 + 1e-10)  # (B, B)
+
+        # Pairwise cosine similarities (embs already L2-normalized)
+        sim = embs @ embs.T  # (B, B), in [-1, 1]
+
+        # Normalize both to [0, 1] for rank comparison
+        # geo: small dist → 0, large dist → 1
+        geo_norm = geo_dist / (geo_dist.max() + 1e-8)
+        # sim: large sim → 0 (close), small sim → 1 (far)
+        sim_norm = 1.0 - (sim - sim.min()) / (sim.max() - sim.min() + 1e-8)
+
+        # Exclude diagonal (self-pairs)
+        mask = ~torch.eye(embs.size(0), dtype=torch.bool, device=embs.device)
+        return F.mse_loss(sim_norm[mask], geo_norm[mask])
+
     def on_train_start(self):
         self._train_start_time = time.time()
 
     def training_step(self, batch, batch_idx):
-        anchor, positive, anchor_coords, pos_coords, bboxes = batch
-
+        anchor, positive, anchor_coords, pos_coords = batch
         q = self.encode(anchor)
         k = self.encode(positive)
 
-        q_ssl, k_ssl = q, k
+        # Use projection head for SSL loss if enabled (backbone CLS used raw at eval)
+        if self.proj_head is not None:
+            q_ssl = self.proj_head(q)
+            k_ssl = self.proj_head(k)
+        else:
+            q_ssl, k_ssl = q, k
 
-        # Don't treat spatially-overlapping chunks as negatives: with stride=128
-        # and chunk=512, neighbouring chunks overlap ~75% and are near-duplicates.
-        iou = batched_iou(bboxes)
-        eye = torch.eye(bboxes.size(0), dtype=torch.bool, device=iou.device)
-        negative_mask = (iou > self.cfg.iou_neg_threshold) & ~eye
-
-        # infonce = symnce_loss(q_ssl, k_ssl, self.cfg.contrastive_temperature, negative_mask=negative_mask)
-        # self.log("train/symnce_loss", infonce, on_step=True, on_epoch=False)
-
-        infonce = self._ntxent_loss(q_ssl, k_ssl)
-        self.log("train/ntxent_loss", infonce, on_step=True, on_epoch=False)
+        infonce = self._infonce_loss(q_ssl, k_ssl)
+        loss = infonce
 
         if self.cfg.georank_weight > 0:
-            gr = georank_loss(q, anchor_coords[:, 0], anchor_coords[:, 1], self.cfg.georank_temperature)
-            self.log("train/georank_loss", gr, on_step=True, on_epoch=False)
-
+            gr = self._georank_loss(q, anchor_coords.to(q.device))
             loss = infonce + self.cfg.georank_weight * gr
-        else:
-            loss = infonce
+            self.log("train/georank_loss", gr, on_step=True, on_epoch=False)
 
         bs = anchor.size(0)
         self._total_samples_seen += bs
@@ -465,7 +471,6 @@ class DinoSSLRetrieverSt1(pl.LightningModule):
         self.log("train/samples_seen", float(self._total_samples_seen), on_step=True, on_epoch=False)
         self.log("train/elapsed_s", elapsed, on_step=True, on_epoch=False)
         self.log("train/samples_per_sec", self._total_samples_seen / max(elapsed, 1), on_step=True, on_epoch=False)
-
         return loss
 
     def on_validation_epoch_start(self):
@@ -505,45 +510,47 @@ class DinoSSLRetrieverSt1(pl.LightningModule):
         self.log("val/R@10", float(metrics["R@10"]), prog_bar=False, sync_dist=False)
 
         elapsed = time.time() - self._train_start_time if self._train_start_time else 0
+        gap = 0.90 - float(metrics["R@1"])
         print(
             f"[VAL flight {VAL_FLIGHT}] R@1={metrics['R@1']:.4f} R@5={metrics['R@5']:.4f} R@10={metrics['R@10']:.4f}"
-            f" | elapsed={elapsed:.0f}s | samples_seen={self._total_samples_seen}"
+            f" | gap_to_90={gap:.4f} | elapsed={elapsed:.0f}s | samples_seen={self._total_samples_seen}"
         )
 
     def configure_optimizers(self):
-        # LLRD (per blocks)
-        early_params = [p for blk in self.backbone.layer[:4] for p in blk.parameters()]
-        early_params += list(self.backbone.embeddings.parameters())
-        mid_params = [p for blk in self.backbone.layer[4:8] for p in blk.parameters()]
-        late_params = [p for blk in self.backbone.layer[8:] for p in blk.parameters()]
-        late_params += list(self.backbone.norm.parameters())
-
-        param_groups = [
-            {"params": early_params, "lr": self.cfg.lr * self.cfg.llrd_decay**2, "name": "early"},  # decay^2
-            {"params": mid_params, "lr": self.cfg.lr * self.cfg.llrd_decay, "name": "mid"},  # decay^1
-            {"params": late_params, "lr": self.cfg.lr, "name": "late"},  # decay^0
-        ]
-
-        # Sanity check all parameters are covered.
-        all_grouped = set(id(p) for g in param_groups for p in g["params"])
-        all_trainable = set(id(p) for p in self.backbone.parameters() if p.requires_grad)
-        missed = all_trainable - all_grouped
-        assert not missed, f"{len(missed)} backbone params not assigned to any LR group"
-
-        # AdamW optimizer
-        optimizer = AdamW(param_groups, weight_decay=self.cfg.weight_decay)
+        trainable = [p for p in self.parameters() if p.requires_grad]
+        optimizer = AdamW(trainable, lr=self.cfg.lr, weight_decay=self.cfg.weight_decay)
 
         warmup = self.cfg.warmup_epochs
-        t0 = self.cfg.cosine_t0 if self.cfg.cosine_t0 > 0 else max(self.cfg.max_epochs - warmup, 1)
+        total = self.cfg.max_epochs
+        t0 = self.cfg.cosine_t0
 
-        # Linear warmup + cosine annealing with (optional) restarts.
-        warmup_sched = LinearLR(optimizer, start_factor=1.0 / max(warmup, 1), end_factor=1.0, total_iters=warmup)
-        cosine_sched = CosineAnnealingWarmRestarts(optimizer, T_0=t0, eta_min=0)
-        scheduler = SequentialLR(optimizer, schedulers=[warmup_sched, cosine_sched], milestones=[warmup])
+        if t0 > 0:
+            # Warm restarts after linear warmup
+            def lr_lambda(epoch):
+                if epoch < warmup:
+                    return (epoch + 1) / warmup
+                e = epoch - warmup
+                cycle_len = t0
+                cycle = e // cycle_len
+                pos = e % cycle_len
+                # eta_min = 1% of max LR
+                return 0.01 + 0.99 * 0.5 * (1 + math.cos(math.pi * pos / cycle_len))
 
+        else:
+
+            def lr_lambda(epoch):
+                if epoch < warmup:
+                    return (epoch + 1) / warmup
+                progress = (epoch - warmup) / max(total - warmup, 1)
+                return 0.01 + 0.99 * 0.5 * (1 + math.cos(math.pi * progress))
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
         return {
             "optimizer": optimizer,
-            "lr_scheduler": {"scheduler": scheduler, "interval": "epoch"},
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "interval": "epoch",
+            },
         }
 
 
@@ -563,22 +570,21 @@ def parse_args() -> Config:
 
     parser.add_argument("--lr", type=float, default=Config.lr)
     parser.add_argument("--weight-decay", type=float, default=Config.weight_decay)
-    parser.add_argument("--gradient-clip-val", type=float, default=Config.gradient_clip_val)
+    parser.add_argument("--temperature", type=float, default=Config.temperature)
 
-    parser.add_argument("--contrastive-temperature", type=float, default=Config.contrastive_temperature)
+    parser.add_argument("--lora-rank", type=int, default=Config.lora_rank)
+    parser.add_argument("--lora-alpha", type=float, default=Config.lora_alpha)
     parser.add_argument("--georank-weight", type=float, default=Config.georank_weight)
-    parser.add_argument("--georank-temperature", type=float, default=Config.georank_temperature)
-
     parser.add_argument("--cosine-t0", type=int, default=Config.cosine_t0)
-    parser.add_argument("--llrd-decay", type=float, default=Config.llrd_decay)
 
     parser.add_argument("--max-epochs", type=int, default=Config.max_epochs)
+    parser.add_argument("--max-steps", type=int, default=Config.max_steps)
     parser.add_argument("--precision", type=str, default=Config.precision)
     parser.add_argument("--seed", type=int, default=Config.seed)
 
     parser.add_argument("--warmup-epochs", type=int, default=Config.warmup_epochs)
+    parser.add_argument("--lora-last-n-blocks", type=int, default=Config.lora_last_n_blocks)
     parser.add_argument("--iou-pos-threshold", type=float, default=Config.iou_pos_threshold)
-    parser.add_argument("--iou-neg-threshold", type=float, default=Config.iou_neg_threshold)
     parser.add_argument("--wandb-project", type=str, default=Config.wandb_project)
     parser.add_argument("--wandb-run-name", type=str, default=None)
     parser.add_argument("--model-name", type=str, default=DINO_MODEL)
@@ -593,19 +599,19 @@ def parse_args() -> Config:
         eval_batch_size=args.eval_batch_size,
         num_workers=args.num_workers,
         lr=args.lr,
-        gradient_clip_val=args.gradient_clip_val,
         weight_decay=args.weight_decay,
-        contrastive_temperature=args.contrastive_temperature,
+        temperature=args.temperature,
+        lora_rank=args.lora_rank,
+        lora_alpha=args.lora_alpha,
+        lora_last_n_blocks=args.lora_last_n_blocks,
         georank_weight=args.georank_weight,
-        georank_temperature=args.georank_temperature,
         cosine_t0=args.cosine_t0,
-        llrd_decay=args.llrd_decay,
         max_epochs=args.max_epochs,
+        max_steps=args.max_steps,
         precision=args.precision,
         seed=args.seed,
         warmup_epochs=args.warmup_epochs,
         iou_pos_threshold=args.iou_pos_threshold,
-        iou_neg_threshold=args.iou_neg_threshold,
         wandb_project=args.wandb_project,
         wandb_run_name=args.wandb_run_name,
     )
@@ -626,6 +632,7 @@ def main():
     print(f"Val flight: {VAL_FLIGHT}")
     print(f"Satellite scales: {SAT_SCALES}")
     print(f"Training stride: {TRAIN_STRIDE} (eval stride: {CHUNK_STRIDE})")
+    print(f"LoRA rank={cfg.lora_rank}, alpha={cfg.lora_alpha}")
     print(f"Data root: {cfg.visloc_root}")
     print(
         f"Train config: batch_size={cfg.batch_size}, eval_batch_size={cfg.eval_batch_size},"
@@ -634,7 +641,7 @@ def main():
     print("=" * 80)
 
     datamodule = VisLocSSLDataModule(cfg)
-    model = DinoSSLRetrieverSt1(cfg)
+    model = DinoSSLRetriever(cfg)
 
     # Count trainable params
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -652,8 +659,6 @@ def main():
         monitor="val/R@1",
         mode="max",
         save_top_k=1,
-        filename="best-{epoch:02d}-R@1={val/R@1:.4f}",
-        auto_insert_metric_name=False,
     )
     early_stop_cb = EarlyStopping(monitor="val/R@1", mode="max", patience=5)
 
@@ -661,16 +666,14 @@ def main():
         accelerator="auto",
         devices=1,
         max_epochs=cfg.max_epochs,
+        max_steps=cfg.max_steps,
         precision=cfg.precision,
         logger=wandb_logger,
-        callbacks=[ckpt_cb, early_stop_cb, LearningRateMonitor(logging_interval="step")],
+        callbacks=[ckpt_cb, early_stop_cb],
         log_every_n_steps=5,
         benchmark=True,
-        gradient_clip_val=cfg.gradient_clip_val,
-        num_sanity_val_steps=0,
     )
 
-    trainer.validate(model, datamodule=datamodule)
     trainer.fit(model, datamodule=datamodule)
 
     # Upload run.log as wandb artifact
