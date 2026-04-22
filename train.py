@@ -113,6 +113,7 @@ class Config:
 
     max_epochs: int = 13
     max_steps: int = -1
+    steps_per_epoch: int = 1000  # limit_train_batches; 0 = natural exhaustion
     precision: str = "16-mixed"
     seed: int = 42
 
@@ -125,7 +126,7 @@ class Config:
     ssl4eo_lon_min: float | None = None
     ssl4eo_lon_max: float | None = None
 
-    wandb_project: str = "autoresearch-ssl-dinov3"
+    wandb_project: str = "autoresearch-ssl-dinov3-ssl4eos12"
     wandb_run_name: str | None = "exp01-global-infonce-lora16"
 
 
@@ -719,6 +720,7 @@ def parse_args() -> Config:
 
     parser.add_argument("--max-epochs", type=int, default=Config.max_epochs)
     parser.add_argument("--max-steps", type=int, default=Config.max_steps)
+    parser.add_argument("--steps-per-epoch", type=int, default=Config.steps_per_epoch)
     parser.add_argument("--precision", type=str, default=Config.precision)
     parser.add_argument("--seed", type=int, default=Config.seed)
 
@@ -759,6 +761,7 @@ def parse_args() -> Config:
         cosine_t0=args.cosine_t0,
         max_epochs=args.max_epochs,
         max_steps=args.max_steps,
+        steps_per_epoch=args.steps_per_epoch,
         precision=args.precision,
         seed=args.seed,
         warmup_epochs=args.warmup_epochs,
@@ -824,11 +827,13 @@ def main():
     )
     early_stop_cb = EarlyStopping(monitor="val/R@1", mode="max", patience=5)
 
+    limit_train_batches = cfg.steps_per_epoch if cfg.steps_per_epoch > 0 else 1.0
     trainer = pl.Trainer(
         accelerator="auto",
         devices=1,
         max_epochs=cfg.max_epochs,
         max_steps=cfg.max_steps,
+        limit_train_batches=limit_train_batches,
         precision=cfg.precision,
         logger=wandb_logger,
         callbacks=[ckpt_cb, early_stop_cb],
