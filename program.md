@@ -4,100 +4,70 @@ This is an experiment to have the LLM do its own research.
 
 ## Setup
 
-To set up a new experiment, work with the user to:
+Branch: **`autoresearch/self-supervised-dinov3-2`**
 
-1. **Agree on a run tag**: propose a tag based on today's date (e.g. `apr17`). The branch `autoresearch/<tag>` must not already exist — this is a fresh run.
-2. **Create the branch**: `git checkout -b autoresearch/<tag>` from current main/master.
-3. **Read the in-scope files**: The repo is small. Read these files for full context:
-   - `README.md` — repository context.
-   - `prepare.py` — fixed constants, dataset loading, and fixed evaluation. Do not modify.
-   - `train.py` — the file you modify. Model, optimizer, training loop.
-4. **Verify data exists**: Check that VisLoc data exists at `VISLOC_ROOT` (default from `prepare.py`). If missing, tell the human to run data preparation first.
-5. **Initialize results.tsv**: Create `results.tsv` with just the header row. The baseline will be recorded after the first run.
-6. **Confirm and go**: Confirm setup looks good.
+In-scope files:
 
-Once you get confirmation, kick off experimentation.
+- `prepare.py` — fixed constants, dataset loading, and fixed evaluation. Do not modify.
+- `train.py` — SSL pre-training script (Exp13 checkpoint already saved). Do not modify.
+- `st2.py` — Stage-2 supervised SFT script. **The file you modify.**
+
+Data exists at `VISLOC_ROOT` (default from `prepare.py`). No setup needed.
 
 ## Experimentation
 
-Each experiment runs on a single GPU. Each SSL experiment has a **budget of 2 hours on average, 3 hours at max** (wall clock).
+Each experiment runs on a single GPU. Each Stage-2 experiment has a **budget of ~45 minutes** (wall clock).
 
 Run command:
 
 ```bash
-uv run train.py > run.log 2>&1
+uv run st2.py --wandb-run-name st2-expN > run.log 2>&1
 ```
 
 Task details:
 
 - Model: `facebook/dinov3-vitb16-pretrain-lvd1689m`
 - Framework: PyTorch Lightning
-- Logging: Weights & Biases (`autoresearch-ssl-dinov3`, auth via env/WANDB_API_KEY)
-- Training approach: **Self-supervised learning on satellite chunks only** (no UAV images during training)
-- Training data: satellite chunks from flights `01, 02, 04, 05, 06, 08, 09, 10, 11` with stride_pixels=64 (denser than eval for more overlapping views)
-- Validation flight: `03` (768 UAV queries, 2860 satellite chunks at default eval stride)
+- Logging: Weights & Biases (`autoresearch-st2-dinov3`, auth via env/WANDB_API_KEY)
+- SSL checkpoint: `checkpoints/dinov3-ssl-best-r@1=0.53-e656447.ckpt` (Exp13, fixed)
+- Train flights: `01, 02, 04, 05, 06, 08, 09, 10, 11`
+- Validation flight: `03` (768 UAV queries, 2860 satellite chunks)
 - Primary metric: `R@1` on flight 03, evaluated with fixed `evaluate_r1` in `prepare.py`
-- Zero-shot baseline (pretrained DINOv3, no training): **R@1 = 0.3398**
-- Previous supervised best (for reference only): R@1 = 0.7357
+- Goal: **R@1 >= 0.90**
 
-Satellite scale priors (usable with SatChunkDataset, adjustable as per your experiments):
+Satellite scale priors (fixed, do not change):
 
 ```python
-sat_scales = {"01": 0.25,"02": 0.25,"03": 0.25,"04": 0.25,"05": 0.4,"06": 0.6,"08": 0.35,"09": 0.25,"10": 0.5,"11": 0.25,}
+sat_scales = {"01": 0.25, "02": 0.25, "03": 0.25, "04": 0.25, "05": 0.40, "06": 0.60, "08": 0.35, "09": 0.25, "10": 0.50, "11": 0.25}
 ```
+
+### Baselines
+
+| System | R@1 | R@5 | R@10 |
+|--------|-----|-----|------|
+| Zero-shot DINOv3 (no training) | 0.3398 | 0.5872 | 0.6732 |
+| SSL-only Exp13 (no UAV labels) | 0.5299 | 0.6641 | 0.7057 |
+| Supervised Exp16 (from pretrained DINOv3) | 0.7357 | 0.8685 | 0.9167 |
+| **st2-exp1 (SSL → supervised SFT)** | **0.7539** | **0.8750** | **0.9232** |
+
+st2-exp1 is the current best and the baseline all further st2 experiments must beat.
 
 ### Evaluation protocol
 
-- Model is trained using self-supervised approaches on satellite chunks only.
-- Backbone adaptation uses **LoRA adapters** (no added projection head). This enables fast screening of which SSL approach works best. Further experiments may try unfreezing last N backbone blocks.
-- At evaluation, extract embeddings using `last_hidden_state[:, 0]` (CLS token) from the LoRA-adapted backbone, **768-d, no projection head**.
-- Evaluation uses the fixed `evaluate_r1` from `prepare.py` on flight 03: 768 UAV queries against 2860 satellite chunks.
-- Satellite TTA (averaging embeddings over 0/90/180/270° rotations) may be used at evaluation.
-
-### Experiment plan (execute in order)
-
-Training experiments are conducted **strictly in the given order**. Step 6 unlocks freedom for exploration based on winners from previous experiments.
-
-1. **InfoNCE baseline**: InfoNCE objective (same loss structure as the supervised setup). The key difference is training data — instead of UAV-satellite pairs, use satellite-only pairs where chunks with **IoU > 0.25 are positives** and chunks with **IoU = 0 are negatives**. Chunks with 0 < IoU <= 0.25 are excluded from the loss.
-2. **VICReg & VICRegL**: Try VICReg and VICRegL as alternative objectives. VICRegL includes a local patch correspondence term that may help with spatial discrimination.
-3. **Multi-scale chunks**: Add chunks at scale_factor // 2 (zoomed out, covering 4× the area) to the training pool. Cut max_epochs by a factor of 1.5 to compensate for the larger dataset.
-4. **GeoRank regularization**: Add a coordinate-based GeoRank rank-preservation regularization term to the best objective from experiments 1-3. Also explore geographic hard negative mining for the contrastive loss.
-5. **Validation flight satellite data**: Add satellite chunks from flight 03 to SSL training. This is not "cheating" — the model never sees UAV query images or GPS labels, only unlabeled satellite tiles. This lets the model learn the visual structure of the evaluation region.
-6. **Free experimentation**: Try combinations of what worked from experiments 1-5, tune hyperparameters, try alternative sampling strategies. Explore and exploit.
-7. **Canny reconstruction** (optional): Add a Canny edge reconstruction objective — the model predicts a Canny-filtered version of the input image. Goal is to learn edge/structure features that transfer across the UAV-satellite domain gap.
-8. **DINO self-distillation** (optional, if R@1 < 0.50 after experiments 1-6): Teacher-student setup. Init both from pretrained DINOv3 weights. Teacher is EMA of student (momentum 0.996→1.0 cosine schedule). Student sees local crops, teacher sees global crops. Standard DINO continued pretraining — no architectural novelty needed. **Budget: 4 hours** (DINO requires multi-crop which is compute-intensive).
-
-### Training notes
-
-- **Training data stride**: Use stride_pixels=64 for training satellite chunks (4× denser than default, ~100k chunks total). Eval stride stays at the default from prepare.py.
-- **Augmentation guidance**: Geometric/scale augmentations (flips, 90° rotations, random resized crop) perform better than color augmentations for satellite SSL. Include slight brightness and contrast jitter (`ColorJitter(brightness=0.3, contrast=0.3, saturation=0, hue=0)`) to simulate weather conditions without altering spectral relationships. Avoid hue/saturation jitter.
-- **Logging**: Track total samples seen by the model, log LR, elapsed time × samples, and elapsed time × optimizer step metrics. Attach `run.log` to wandb as an artifact.
-- **Initial max_epochs**: 20. Agent can adjust freely if experiments justify it.
-
-### Research context
-
-These findings from the literature should guide experiment design:
-
-- **Smarter pair construction >> more data or architecture changes.** The biggest wins come from what counts as positive, what's a true hard negative, and how to weight ambiguous pairs (GeoRank, Sample4Geo, Semivariogram reweighting papers).
-- **False negative danger**: Geographically close chunks that look similar are likely false negatives, not hard negatives. Naive hard negative mining based on visual similarity alone will incorrectly push apart representations of genuinely related locations (Semivariogram paper, 2025).
-- **GeoRank** (Burgert et al., WACV 2025): Rank-based geographic regularization validated with DINO. Adds an MSE loss between embedding similarity ranks and geographic distance ranks. Framework-agnostic, consistent gains.
-- **Dataset size**: SSL performance saturates at 100-200k images (GeoRank). DINO-MC matched SeCo (1M images) with only 100k. The ~100k chunks from denser stride should be sufficient.
-- **GSD encoding** (Scale-MAE, WaveMAE): Encoding ground sample distance into positional embeddings improves performance when mixing scales. At a single fixed scale, less relevant.
+- Load SSL Exp13 checkpoint, merge LoRA into weights, unfreeze all backbone params.
+- Backbone CLS token → 2-layer MLP projection head → 512-d L2-normalised embedding.
+- Satellite TTA: average embeddings over 4 rotations (0°/90°/180°/270°), re-normalise.
+- Evaluate with fixed `evaluate_r1` from `prepare.py`.
 
 **What you CAN do:**
 
-- Modify `train.py` only. Everything in `train.py` is fair game (loss functions, datasets, samplers, augmentations, optimizer/scheduler, LoRA config, precision, scale tuning, etc.).
-- Add LoRA adapters, modify the training loop, create new SSL dataset classes.
-- Perform significant exploration in step 6 based on findings from steps 1-5.
+- Modify `st2.py` only. Loss, sampler, augmentations, optimizer, scheduler, head architecture, gradient clipping, warmup, LR values, max_epochs — all fair game.
 
 **What you CANNOT do:**
 
-- Modify `prepare.py`.
-- Modify the fixed evaluation logic in `prepare.py`.
-- Install new packages or add dependencies during the loop.
-- Use UAV images during SSL training (satellite chunks only).
-
-**The goal is simple: maximize val `R@1` on flight 03 using self-supervised learning on satellite imagery.**
+- Modify `prepare.py` or `train.py`.
+- Change the SSL checkpoint path (always load `dinov3-ssl-best-r@1=0.53-e656447.ckpt`).
+- Install new packages.
 
 **Simplicity criterion**: all else equal, simpler is better. Keep complexity proportional to gains.
 
@@ -106,7 +76,7 @@ These findings from the literature should guide experiment design:
 At run completion, extract key metrics from log:
 
 ```bash
-grep "R@1\|R@5\|R@10\|Best checkpoint\|Best val/R@1" run.log
+grep "VAL flight 03\|Best checkpoint\|Best val/R@1" run.log | tail -20
 ```
 
 If grep is empty, run crashed. Read stack trace:
@@ -144,42 +114,88 @@ d4e5f6g	0.000000	0.000000	0.000000	crash	OOM at batch_size=64
 
 Do not commit `results.tsv`.
 
-## Prior experiments findings & project knowledge
+## Known issues from st2-exp1 & experiment plan
 
-### Zero-shot baseline
+### Loss dynamics analysis (st2-exp1)
 
-Pretrained DINOv3 (no training, CLS token embeddings): R@1=0.3398, R@5=0.5872, R@10=0.6732. This is the baseline all SSL experiments must beat.
+Step-level loss statistics per epoch:
 
-### Previous supervised experiments (branch: autoresearch/supervised-dinov3)
+| Epoch | mean | std | p2p | Note |
+|-------|------|-----|-----|------|
+| 1 | 2.098 | **0.403** | 1.720 | no warmup — worst oscillation |
+| 6–9 | ~1.32 | ~0.195 | ~0.80 | stable mid-run |
+| 10 | 1.258 | 0.207 | 0.911 | restart |
+| 15 | 1.066 | 0.185 | 0.829 | restart → 4th cycle regressed |
 
-A prior supervised training run fine-tuned DINOv3 on UAV-satellite pairs with multi-positive InfoNCE and reached R@1=0.7357. Key findings from 16 supervised experiments:
-- **Resolution matters**: 336px input gave +7% R@1 over 224px (preserve satellite texture)
-- **Hard negative mining is crucial**: Two-flight batch sampler gave +5% R@1 (force spatial precision)
-- **Augmentation helps**: Geometric augmentations + domain-gap targeting gave +3.5% R@1
-- **Full backbone fine-tuning with LLRD beats partial freezing**: 3-tier LR (5e-6 / 1e-5 / 2e-5 / 5e-5 for head)
-- **What failed**: GeM pooling, asymmetric heads, register token concatenation, RandomResizedCrop on UAV, larger batch sizes (96 > 64 was worse)
-- **R@10=0.9167**: The model finds the right area but struggles to rank the exact chunk #1
+Three root causes:
+1. **No warmup**: Starting at full LR with a freshly initialised projection head causes epoch-1 std=0.403 (2× stable-run average). Large early gradients propagate into the SSL-adapted backbone before the head has converged.
+2. **Structural batch variance**: `TwoFlightBatchSampler` + multi-positive InfoNCE with variable positive counts per batch creates irreducible step-level variance (~std=0.18–0.22).
+3. **CosineWarmRestarts T_mult=1**: The 4th restart at epoch 15 fired full LR into a model that had just peaked at R@1=0.7539 (epoch 14). The entire final 6-epoch cycle never recovered (0.71–0.74).
 
-### Dataset description
+### Experiment plan (execute in order)
 
-VisLoc dataset: UAV images are high-quality nadir photos from a Mavic-like drone. Satellite imagery is a large GeoTIFF map split into overlapping chunks. The goal is UAV-to-satellite geo-localization through image retrieval. The domain gap comes from camera quality differences (UAV images have better quality, different colors, slight haze, lower contrast) and potential timing differences (satellite images may be outdated). Training regions include some bodies of water.
+**st2-exp2 — Stabilise: gradient clipping + warmup + plain cosine decay**
 
-### Environment
+Three targeted fixes in one experiment:
+- `gradient_clip_val=1.0` in the Trainer (direct fix for step std)
+- 2-epoch linear warmup for all param groups (fixes epoch-1 spike)
+- Replace `CosineAnnealingWarmRestarts` with `SequentialLR(linear_warmup, CosineAnnealingLR)` over 20 epochs — removes the destructive 4th restart
 
-The experiments loop is conducted on a powerful machine that has an A100 GPU with 80GB of VRAM - keep that in mind and utilize the GPU accordingly.
+Expected: smoother loss curve, best epoch pushed into epochs 16–18 instead of epoch 14, R@1 > 0.7539.
+
+**st2-exp3 — Lower head LR: 5e-5 → 2e-5**
+
+The projection head starts from random init and currently gets lr=5e-5 — 10× the early backbone and 2.5× the late backbone. This asymmetry is the dominant source of early instability. Reduce head LR to match the late-backbone rate (2e-5). The head is shallow and will still adapt quickly. Run on top of the best scheduler config from exp2.
+
+**st2-exp4 — Deeper LLRD: add mid-to-late transition layer**
+
+Current LLRD has 3 backbone tiers (5e-6 / 1e-5 / 2e-5). Add a 4th tier: blocks 6–7 at 5e-6 (currently grouped with blocks 4–5 at 1e-5), blocks 8–9 at 1e-5, blocks 10–11 at 2e-5. This gives a smoother LR gradient through the SSL-adapted layers (8–11 were LoRA-trained and are most sensitive to over-shooting).
+
+**st2-exp5 — Free experimentation**
+
+Based on which fixes helped most in exp2–4, explore:
+- Asymmetric augmentation on UAV query (stronger ColorJitter + GaussianBlur + RandomGrayscale to simulate sensor gap — matches SSL Exp13 anchor augmentation)
+- Longer training (30 epochs with warmup + cosine)
+- Larger projection head (768 → 768 → 512 with LayerNorm)
+- Combine best components from exp2–4
+
+### Training notes
+
+- **Epoch budget**: 20 epochs unless a specific experiment justifies more.
+- **Checkpoints**: saved to `checkpoints/st2-dinov3/`. Best by `val/R@1`.
+- **Early stopping**: patience=6 on `val/R@1`.
+- **Precision**: `16-mixed` on A100.
+
+## Prior experiments findings
+
+### SSL branch (train.py)
+
+- **Cross-scale pairs** (anchor=25–50%, positive=75–100%) are the core SSL innovation: directly simulates UAV (zoomed-in) vs satellite (full-scale) domain gap.
+- **Asymmetric augmentation** on anchor (stronger ColorJitter + GaussianBlur + RandomGrayscale) simulates UAV sensor/temporal gap and is what enables 5 consecutive epochs of improvement (Exp13). Mild augmentation on positive preserves satellite appearance.
+- **LoRA (rank=16, alpha=32, last 4 blocks)** + fixed temperature=0.07 is the stable training config. Learnable temperature collapsed in early experiments.
+- **Degradation pattern**: Without strong augmentation, peak is always at epoch 0–1 (warmup boundary), then monotonic degradation as SSL erodes UAV-compatible DINO features.
+
+### Stage-2 SFT (st2.py / st2-exp1)
+
+- **SSL → supervised SFT beats supervised-only by +1.82 pp R@1** (0.7539 vs 0.7357). The SSL backbone adaptation to satellite scale invariance gives a meaningful head-start.
+- **Best epoch was 14 of 20** — the 4th cosine restart regressed the model. Removing restarts or using T_mult=2 should push best epoch later and higher.
+- **R@10=0.9232** at best: the correct chunk is in the top 10 almost universally. The remaining gap to R@1=0.90 is a ranking precision problem, not a retrieval coverage problem.
+- **LoRA merge is clean**: strict load_state_dict → merge → unfreeze → supervised LLRD works correctly. No interference.
+
+### Supervised branch (train-supervised.py, Exp16)
+
+- **TwoFlightBatchSampler** (32+32 per batch from 2 different flights) is the most impactful hard-negative strategy (+5 pp R@1).
+- **Satellite TTA** (4 rotations) adds ~0.5 pp R@1 at zero training cost. Always on.
+- **GeM pooling, asymmetric heads, register tokens, RandomResizedCrop on UAV, larger batch sizes** all failed.
 
 ## The experiment loop
-
-The experiment runs on a dedicated branch (agreed during setup).
-
-Follow the **experiment plan in order** (steps 1-8 above). Within each step, you may run multiple sub-experiments (e.g. trying different hyperparameters for InfoNCE in step 1). Step 6 unlocks free experimentation.
 
 LOOP:
 
 1. Look at git state: current branch/commit.
-2. Implement the next experiment from the plan by modifying `train.py`.
-3. git commit with a descriptive message.
-4. Run experiment: `uv run train.py > run.log 2>&1` (redirect everything — do NOT use tee or let output flood your context)
+2. Implement the next experiment from the plan by modifying `st2.py`.
+3. `git commit` with a descriptive message.
+4. Run: `uv run st2.py --wandb-run-name st2-expN > run.log 2>&1`
 5. Read out results from `run.log`.
 6. If metrics are missing, run crashed. Use `tail -n 50 run.log` and attempt fix; if not quickly fixable, log crash and move on.
 7. Record results in `results.tsv` with a textual description of the attempt.
@@ -187,10 +203,8 @@ LOOP:
 9. If `R@1` is equal/worse, reset to previous best commit.
 10. Move to the next experiment in the plan.
 
-**Timeout**: Each experiment should take ~2 hours on average, 3 hours max. If a run exceeds 3.5 hours, kill it, leave a timeout note in the results, and use the best validation metric logged so far. Exception: experiment 8 (DINO self-distillation) has a 4-hour budget.
+**Timeout**: If a run exceeds 55 minutes, kill it and use the best val metric logged so far.
 
 **Crashes**: If a run crashes (OOM, or a bug, or etc.), use your judgment: If it's something dumb and easy to fix (e.g. a typo, a missing import), fix it and re-run. If the idea itself is fundamentally broken, just skip it, log "crash" as the status in the tsv, and move on.
 
-**NEVER STOP**: Once the experiment loop has begun (after the initial setup), do NOT pause to ask the human if you should continue. Do NOT ask "should I keep going?" or "is this a good stopping point?". The human might be asleep, or gone from a computer and expects you to continue working _indefinitely_ until you are manually stopped. You are autonomous. If you run out of ideas in step 6 (free experimentation), think harder — read related papers on the topic (use arxiv and other sources), re-read the in-scope files for new angles, try combining previous near-misses, try more radical approaches. The loop runs until the human interrupts you, period.
-
-As an example use case, a user might leave you running while they sleep. Each SSL experiment takes ~2 hours, so you can run about 4-5 experiments overnight. The user then wakes up to experimental results, all completed by you while they slept!
+**NEVER STOP**: Once the experiment loop has begun, do NOT pause to ask the human if you should continue. You are autonomous. The loop runs until the human interrupts you, period.
