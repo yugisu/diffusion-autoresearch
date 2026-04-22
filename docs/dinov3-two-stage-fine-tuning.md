@@ -85,52 +85,81 @@ See [`dinov3-self-supervised-fine-tuning.md`](dinov3-self-supervised-fine-tuning
 
 ## Stage 2: Supervised Fine-Tuning
 
-### Fixed configuration (all Stage-2 experiments)
+### Best configuration (Exp9 — R@1 = 0.7786)
+
+This is the exact configuration that produced the best result. Each component was validated through ablation; see the experiment log for what happens when any one is changed.
 
 ```python
 # Model
 backbone: SSL Exp13 checkpoint, LoRA merged, all params unfrozen
 head: Linear(768, 768) -> GELU -> Dropout(0.1) -> Linear(768, 512) -> L2-norm
+logit_scale: learnable, initialised to log(1/0.07), clamped to exp(logit_scale) <= 100
 
 # Training
-batch_size = 64
-max_epochs = 20
-precision = "16-mixed"
+image_size        = 336        # px; both UAV and satellite resized to 336x336
+batch_size        = 64
+max_epochs        = 20
+precision         = "16-mixed"
 gradient_clip_val = 1.0
+weight_decay      = 1e-4
+seed              = 42
 
-# Backbone LLRD (4-tier, introduced in Exp5)
-lr_emb_blocks03  = 5e-6    # embedding + blocks 0-3
+# UAV augmentation (training only)
+RandomHorizontalFlip(p=0.5)
+RandomPerspective(distortion_scale=0.2, p=0.5)
+ColorJitter(brightness=0.4, contrast=0.4, saturation=0.3, hue=0.1)
+GaussianBlur(kernel_size=5, sigma=(0.1, 2.0))
+# NOTE: no RandomRotation on UAV — important for training/inference consistency
+
+# Satellite augmentation (training only)
+RandomHorizontalFlip(p=0.5)
+RandomVerticalFlip(p=0.5)
+RandomRotation(degrees=180)
+ColorJitter(brightness=0.4, contrast=0.4, saturation=0.3, hue=0.1)
+
+# Batch sampling
+TwoFlightBatchSampler: k_flights=3, batch_size=64 (~21 samples/flight)
+# 3 flights chosen randomly each batch; geographic diversity creates hard in-batch negatives
+
+# Backbone LLRD (4-tier)
+lr_emb_blocks03  = 5e-6    # embedding + transformer blocks 0-3 (low-level features)
 lr_blocks47      = 1e-5    # blocks 4-7
-lr_blocks89      = 1.5e-5  # blocks 8-9
-lr_blocks1011    = 2e-5    # blocks 10-11 + norm
-lr_head          = 2e-5    # projection head
+lr_blocks89      = 1.5e-5  # blocks 8-9 (LoRA-adapted in Stage 1, most sensitive)
+lr_blocks1011    = 2e-5    # blocks 10-11 + LayerNorm
+lr_head          = 2e-5    # projection head (randomly initialised)
 
-# Batch sampling (best config: Exp5+)
-TwoFlightBatchSampler: k_flights=3, ~21 samples/flight from 3 randomly chosen flights
+# Scheduler — CosineAnnealingWarmRestarts, step-level
+T_0 = 10 * steps_per_epoch  # 10-epoch cycle (1 restart over 20 epochs)
+eta_min = 2e-5 * 0.05       # = 1e-6; LR floor at cycle trough
+# IMPORTANT: with the GPS exclusion zone, cycle-1 peaks at ~epoch 5 and the
+# restart at epoch 10 is destructive (cycle-2 never recovers). Stop after
+# cycle-1 or use early stopping with patience <= 6.
 
 # Validation
-Satellite TTA: average over 4 rotations (0°/90°/180°/270°), re-normalise
-EarlyStopping: patience=6 on val/R@1
+Satellite TTA: encode at 0°/90°/180°/270°, average, re-normalise
+EarlyStopping: patience=6, monitor=val/R@1
 
-# GPS proximity mask
-pos_threshold_m   = 60.0   # dist < 60m → positive
-ignore_threshold_m = 150.0  # 60m–150m → excluded from denominator
-# dist > 150m → hard negative
+# GPS proximity mask (applied per batch at training time)
+pos_threshold_m    = 60.0   # GPS dist < 60m → positive (diagonal always positive)
+ignore_threshold_m = 150.0  # 60m ≤ dist < 150m → excluded from softmax denominator
+                            # dist ≥ 150m → hard negative (contributes to denominator)
 ```
 
 ### Loss
 
-Multi-positive InfoNCE with GPS exclusion zone (introduced in Exp9):
+Multi-positive InfoNCE with GPS exclusion zone:
 
 ```
 For each (UAV_i, SAT_j) pair in batch:
   pos_mask[i,j]    = 1  if GPS_dist(i,j) < 60m  or  i == j
   ignore_mask[i,j] = 1  if 60m ≤ GPS_dist(i,j) < 150m  and  i ≠ j
 
-logits = (Q @ K.T) * exp(logit_scale)
-logits -= 1e9 * ignore_mask          # exclude ambiguous zone from denominator
-loss   = 0.5 * (InfoNCE(Q→K) + InfoNCE(K→Q))
+logits = (Q @ K.T) * exp(logit_scale)          # learnable temperature
+logits -= 1e9 * ignore_mask                    # mask ambiguous zone out of denominator
+loss   = 0.5 * (InfoNCE(Q→K) + InfoNCE(K→Q))  # symmetric
 ```
+
+The GPS exclusion zone is the single most impactful component. Without it (Exp1–8), the 60–150m satellite tiles around each UAV query corrupt both the positive and negative signal simultaneously — they are close enough to share ground features with the true match but too far to be correct answers. Excluding them sharpens the loss from ~1.1 nats to ~0.825 nats and broke a 3-experiment plateau at R@1=0.77.
 
 ---
 
