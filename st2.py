@@ -6,12 +6,11 @@ Backbone: loaded from SSL Exp13 checkpoint (LoRA merged into weights), then full
 Training: multi-positive InfoNCE + GPS proximity mask + TwoFlightBatchSampler
           + CosineAnnealingWarmRestarts T_0=10 epochs (2 cycles) + grad clip 1.0 + head lr=2e-5.
 
-exp4 changes vs exp3:
-  - Deeper LLRD: 4 backbone tiers (5e-6 / 1e-5 / 1.5e-5 / 2e-5) instead of 3
-    Smooths the abrupt 1e-5→2e-5 jump across SSL-adapted blocks 8-11.
-  - UAV aug aligned with SSL Exp13 anchor aug: ColorJitter(0.5/0.5/0.3/0.1),
-    RandomGrayscale(p=0.1), GaussianBlur(k=9). Eliminates distribution gap between
-    what the backbone was adapted to and what SFT trains on.
+exp5 changes vs exp3:
+  - 3-flight batch sampling: each batch draws from 3 geographic regions (was 2).
+    ~21 samples per flight in a 64-sample batch vs ~32. More geographically diverse
+    negatives per batch — directly targets the R@1 ranking precision gap.
+  - 4-tier LLRD (5e-6/1e-5/1.5e-5/2e-5) in isolation from exp4 (no aug change).
 
 SSL checkpoint:  checkpoints/dinov3-ssl-best-r@1=0.53-e656447.ckpt
 Supervised baseline: R@1 = 73.6% (Exp16, trained from pretrained DINOv3)
@@ -243,11 +242,12 @@ class VisLocTrainPairDataset(Dataset):
 
 
 class TwoFlightBatchSampler(torch.utils.data.Sampler):
-    """Each batch draws half from one flight, half from another — geographic hard negatives."""
+    """Each batch draws from k_flights geographic regions — geographic hard negatives."""
 
-    def __init__(self, dataset: VisLocTrainPairDataset, batch_size: int):
+    def __init__(self, dataset: VisLocTrainPairDataset, batch_size: int, k_flights: int = 2):
         self.batch_size = batch_size
-        self.half = batch_size // 2
+        self.k = k_flights
+        self.per_flight = batch_size // k_flights
         self.flight_indices: Dict[str, List[int]] = {}
         for idx, (flight, _) in enumerate(dataset.samples):
             self.flight_indices.setdefault(flight, []).append(idx)
@@ -263,16 +263,16 @@ class TwoFlightBatchSampler(torch.utils.data.Sampler):
             random.shuffle(idxs)
         pointers = {f: 0 for f in self.flights}
         for _ in range(len(self)):
-            chosen = random.sample(self.flights, min(2, len(self.flights)))
+            chosen = random.sample(self.flights, min(self.k, len(self.flights)))
             batch: List[int] = []
             for f in chosen:
                 ptr = pointers[f]
                 idxs = shuffled[f]
-                end = ptr + self.half
+                end = ptr + self.per_flight
                 if end > len(idxs):
                     random.shuffle(idxs)
                     ptr = 0
-                    end = self.half
+                    end = self.per_flight
                 batch.extend(idxs[ptr:end])
                 pointers[f] = end % len(idxs)
             yield batch
@@ -291,14 +291,13 @@ class VisLocDataModule(pl.LightningDataModule):
         mean = self.processor.image_mean
         std = self.processor.image_std
 
-        # UAV augmentations — aligned with SSL Exp13 anchor aug to eliminate distribution gap
+        # UAV augmentations from supervised Exp16
         self.train_uav_transform = transforms.Compose([
             transforms.Resize((cfg.image_size, cfg.image_size)),
             transforms.RandomHorizontalFlip(p=0.5),
             transforms.RandomPerspective(distortion_scale=0.2, p=0.5),
-            transforms.ColorJitter(brightness=0.5, contrast=0.5, saturation=0.3, hue=0.1),
-            transforms.RandomGrayscale(p=0.1),
-            transforms.GaussianBlur(kernel_size=9, sigma=(0.1, 2.0)),
+            transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.3, hue=0.1),
+            transforms.GaussianBlur(kernel_size=5, sigma=(0.1, 2.0)),
             transforms.ToTensor(),
             transforms.Normalize(mean=mean, std=std),
         ])
@@ -344,7 +343,7 @@ class VisLocDataModule(pl.LightningDataModule):
             )
 
     def train_dataloader(self):
-        sampler = TwoFlightBatchSampler(self.train_ds, self.cfg.batch_size)
+        sampler = TwoFlightBatchSampler(self.train_ds, self.cfg.batch_size, k_flights=3)
         return DataLoader(
             dataset=self.train_ds,
             batch_sampler=sampler,
@@ -376,8 +375,8 @@ class DinoCrossViewRetrieverST2(pl.LightningModule):
     Backbone init: SSL checkpoint (LoRA merged) — satellite-adapted features.
     Architecture:  backbone CLS → 2-layer MLP projection head → L2-normalised embedding.
     Loss:          multi-positive InfoNCE with GPS proximity mask (100 m threshold).
-    Optimizer:     AdamW with LLRD (5e-6 / 1e-5 / 1.5e-5 / 2e-5 / 2e-5 for head).
-    Scheduler:     CosineAnnealingWarmRestarts, T_0=10 epochs, step-level.
+    Optimizer:     AdamW with LLRD (5e-6 / 1e-5 / 2e-5 / 5e-5 for head).
+    Scheduler:     CosineAnnealingWarmRestarts, T_0=5 epochs, step-level.
     """
 
     def __init__(self, cfg: Config):
@@ -485,8 +484,6 @@ class DinoCrossViewRetrieverST2(pl.LightningModule):
         early_backbone_params = list(self.backbone.embeddings.parameters())
         early_backbone_params += [p for blk in self.backbone.layer[:4] for p in blk.parameters()]
         mid_backbone_params = [p for blk in self.backbone.layer[4:8] for p in blk.parameters()]
-        # Split late backbone into two tiers: 8-9 (SSL-adapted mid-late) at 1.5e-5,
-        # 10-11 (SSL-adapted top) at 2e-5 — smooths the 1e-5→2e-5 jump
         mid_late_backbone_params = [p for blk in self.backbone.layer[8:10] for p in blk.parameters()]
         top_backbone_params = [p for blk in self.backbone.layer[10:] for p in blk.parameters()]
         top_backbone_params += list(self.backbone.norm.parameters())
