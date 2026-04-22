@@ -6,10 +6,12 @@ Backbone: loaded from SSL Exp13 checkpoint (LoRA merged into weights), then full
 Training: multi-positive InfoNCE + GPS proximity mask + TwoFlightBatchSampler
           + CosineAnnealingWarmRestarts T_0=10 epochs (2 cycles) + grad clip 1.0 + head lr=2e-5.
 
-exp10 changes vs exp9:
-  - EarlyStopping patience=10 (was 6). Exp9 peaked epoch 5, restart at epoch 10
-    caused dip to 0.7409 at epoch 11, early stop fired immediately. Patience=10
-    survives through the restart dip and gives cycle-2 (epochs 11-15) time to climb.
+exp11 changes vs exp9:
+  - ReduceLROnPlateau instead of CosineAnnealingWarmRestarts. The warm restart was
+    consistently destructive with the GPS exclusion zone: cycle-1 peaks ~epoch 5,
+    restart at epoch 10 overshoots the basin, cycle-2 never recovers (exp9: 0.7786,
+    exp10 cycle-2 peak: 0.7604). ReduceLROnPlateau decays LR by 0.5 when val/R@1
+    stalls for 3 epochs — adaptive, monotonically decreasing, no destructive jumps.
   - GPS exclusion zone, 3-flight sampling, 4-tier LLRD all retained from exp9.
 
 SSL checkpoint:  checkpoints/dinov3-ssl-best-r@1=0.53-e656447.ckpt
@@ -41,7 +43,7 @@ import torch.nn.functional as F
 from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint
 from lightning.pytorch.loggers import WandbLogger
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 from transformers import AutoImageProcessor, AutoModel
@@ -507,12 +509,17 @@ class DinoCrossViewRetrieverST2(pl.LightningModule):
         ]
         optimizer = AdamW(param_groups, weight_decay=self.cfg.weight_decay)
 
-        train_batches = max(len(self.trainer.datamodule.train_dataloader()), 1)
-        T_0 = 10 * train_batches  # 2 cycles over 20 epochs instead of 4; eliminates destructive late restarts
-        scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=T_0, T_mult=1, eta_min=2e-5 * 0.05)
+        # ReduceLROnPlateau: halve LR when val/R@1 stalls 3 epochs. Monotonically
+        # decreasing — avoids destructive LR spikes from CosineWarmRestarts.
+        scheduler = ReduceLROnPlateau(optimizer, mode="max", factor=0.5, patience=3, min_lr=1e-7)
         return {
             "optimizer": optimizer,
-            "lr_scheduler": {"scheduler": scheduler, "interval": "step"},
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "monitor": "val/R@1",
+                "interval": "epoch",
+                "frequency": 1,
+            },
         }
 
 
@@ -601,7 +608,7 @@ def main():
         mode="max",
         save_top_k=1,
     )
-    early_stop_cb = EarlyStopping(monitor="val/R@1", mode="max", patience=10)
+    early_stop_cb = EarlyStopping(monitor="val/R@1", mode="max", patience=6)
 
     trainer = pl.Trainer(
         accelerator="auto",
