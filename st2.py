@@ -6,6 +6,13 @@ Backbone: loaded from SSL Exp13 checkpoint (LoRA merged into weights), then full
 Training: multi-positive InfoNCE + GPS proximity mask + TwoFlightBatchSampler
           + CosineAnnealingWarmRestarts T_0=10 epochs (2 cycles) + grad clip 1.0 + head lr=2e-5.
 
+exp4 changes vs exp3:
+  - Deeper LLRD: 4 backbone tiers (5e-6 / 1e-5 / 1.5e-5 / 2e-5) instead of 3
+    Smooths the abrupt 1e-5→2e-5 jump across SSL-adapted blocks 8-11.
+  - UAV aug aligned with SSL Exp13 anchor aug: ColorJitter(0.5/0.5/0.3/0.1),
+    RandomGrayscale(p=0.1), GaussianBlur(k=9). Eliminates distribution gap between
+    what the backbone was adapted to and what SFT trains on.
+
 SSL checkpoint:  checkpoints/dinov3-ssl-best-r@1=0.53-e656447.ckpt
 Supervised baseline: R@1 = 73.6% (Exp16, trained from pretrained DINOv3)
 Goal: R@1 > 73.6% via SSL head-start on satellite domain
@@ -284,13 +291,14 @@ class VisLocDataModule(pl.LightningDataModule):
         mean = self.processor.image_mean
         std = self.processor.image_std
 
-        # UAV augmentations from supervised Exp16
+        # UAV augmentations — aligned with SSL Exp13 anchor aug to eliminate distribution gap
         self.train_uav_transform = transforms.Compose([
             transforms.Resize((cfg.image_size, cfg.image_size)),
             transforms.RandomHorizontalFlip(p=0.5),
             transforms.RandomPerspective(distortion_scale=0.2, p=0.5),
-            transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.3, hue=0.1),
-            transforms.GaussianBlur(kernel_size=5, sigma=(0.1, 2.0)),
+            transforms.ColorJitter(brightness=0.5, contrast=0.5, saturation=0.3, hue=0.1),
+            transforms.RandomGrayscale(p=0.1),
+            transforms.GaussianBlur(kernel_size=9, sigma=(0.1, 2.0)),
             transforms.ToTensor(),
             transforms.Normalize(mean=mean, std=std),
         ])
@@ -368,8 +376,8 @@ class DinoCrossViewRetrieverST2(pl.LightningModule):
     Backbone init: SSL checkpoint (LoRA merged) — satellite-adapted features.
     Architecture:  backbone CLS → 2-layer MLP projection head → L2-normalised embedding.
     Loss:          multi-positive InfoNCE with GPS proximity mask (100 m threshold).
-    Optimizer:     AdamW with LLRD (5e-6 / 1e-5 / 2e-5 / 5e-5 for head).
-    Scheduler:     CosineAnnealingWarmRestarts, T_0=5 epochs, step-level.
+    Optimizer:     AdamW with LLRD (5e-6 / 1e-5 / 1.5e-5 / 2e-5 / 2e-5 for head).
+    Scheduler:     CosineAnnealingWarmRestarts, T_0=10 epochs, step-level.
     """
 
     def __init__(self, cfg: Config):
@@ -477,15 +485,19 @@ class DinoCrossViewRetrieverST2(pl.LightningModule):
         early_backbone_params = list(self.backbone.embeddings.parameters())
         early_backbone_params += [p for blk in self.backbone.layer[:4] for p in blk.parameters()]
         mid_backbone_params = [p for blk in self.backbone.layer[4:8] for p in blk.parameters()]
-        late_backbone_params = [p for blk in self.backbone.layer[8:] for p in blk.parameters()]
-        late_backbone_params += list(self.backbone.norm.parameters())
+        # Split late backbone into two tiers: 8-9 (SSL-adapted mid-late) at 1.5e-5,
+        # 10-11 (SSL-adapted top) at 2e-5 — smooths the 1e-5→2e-5 jump
+        mid_late_backbone_params = [p for blk in self.backbone.layer[8:10] for p in blk.parameters()]
+        top_backbone_params = [p for blk in self.backbone.layer[10:] for p in blk.parameters()]
+        top_backbone_params += list(self.backbone.norm.parameters())
         head_params = list(self.proj.parameters()) + [self.logit_scale]
 
         param_groups = [
             {"params": early_backbone_params, "lr": 5e-6},
             {"params": mid_backbone_params, "lr": 1e-5},
-            {"params": late_backbone_params, "lr": 2e-5},
-            {"params": head_params, "lr": 2e-5},  # lowered from 5e-5: fresh head was dominant noise source
+            {"params": mid_late_backbone_params, "lr": 1.5e-5},
+            {"params": top_backbone_params, "lr": 2e-5},
+            {"params": head_params, "lr": 2e-5},
         ]
         optimizer = AdamW(param_groups, weight_decay=self.cfg.weight_decay)
 
