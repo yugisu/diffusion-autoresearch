@@ -28,7 +28,6 @@ import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Tuple
 
 import pandas as pd
 import lightning.pytorch as pl
@@ -40,8 +39,7 @@ from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint
 from lightning.pytorch.loggers import WandbLogger
 from PIL import Image
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR
-from torch.utils.data import DataLoader, Dataset, default_collate
+from torch.utils.data import DataLoader, default_collate
 from torchvision import transforms
 from transformers import AutoImageProcessor, AutoModel
 
@@ -53,7 +51,6 @@ from prepare import (
     VISLOC_ROOT,
     SatChunkDataset,
     UAVDataset,
-    build_ground_truth,
     evaluate_r1,
 )
 from ssl4eos12_dataset import build_ssl4eos12_dataset
@@ -65,10 +62,7 @@ torch.set_float32_matmul_precision("high")
 # -----------------------------------------------------------------------------
 
 DINO_MODEL = "facebook/dinov3-vitb16-pretrain-lvd1689m"
-TRAIN_FLIGHTS = ["01", "02", "03", "04", "05", "06", "08", "09", "10", "11"]  # 03 added: learn eval region structure
 VAL_FLIGHT = "03"
-
-TRAIN_STRIDE = 64  # denser stride for SSL training (~4x more chunks)
 
 SAT_SCALES = {
     "01": 0.25,
@@ -107,9 +101,6 @@ class Config:
     lora_rank: int = 16
     lora_alpha: float = 32.0
     lora_last_n_blocks: int = 4  # only last N blocks get LoRA (0=all)
-
-    iou_pos_threshold: float = 0.50
-    iou_neg_threshold: float = 0.0  # IoU == 0 → negative
 
     max_epochs: int = 7
     max_steps: int = -1
@@ -227,75 +218,6 @@ class TimeBudgetCallback(pl.Callback):
 
 
 # -----------------------------------------------------------------------------
-# SSL Dataset — satellite chunks only, IoU-based positive mining
-# -----------------------------------------------------------------------------
-
-
-def compute_iou(box_a: Tuple[float, ...], box_b: Tuple[float, ...]) -> float:
-    """Compute IoU between two (lat_min, lon_min, lat_max, lon_max) bboxes."""
-    lat_min = max(box_a[0], box_b[0])
-    lon_min = max(box_a[1], box_b[1])
-    lat_max = min(box_a[2], box_b[2])
-    lon_max = min(box_a[3], box_b[3])
-
-    if lat_min >= lat_max or lon_min >= lon_max:
-        return 0.0
-
-    inter = (lat_max - lat_min) * (lon_max - lon_min)
-    area_a = (box_a[2] - box_a[0]) * (box_a[3] - box_a[1])
-    area_b = (box_b[2] - box_b[0]) * (box_b[3] - box_b[1])
-    union = area_a + area_b - inter
-    return inter / union if union > 0 else 0.0
-
-
-class SatSSLDataset(Dataset):
-    """
-    Cross-scale SSL dataset: anchor = zoomed-in crop (25-50% of chunk area),
-    positive = full-scale view of the SAME chunk. Trains scale invariance that
-    bridges the UAV (high-res zoomed-in) ↔ satellite (lower-res full area) gap.
-    """
-
-    def __init__(
-        self,
-        root: str,
-        flights: List[str],
-        sat_scales: Dict[str, float],
-        anchor_transform,
-        positive_transform,
-        iou_pos_threshold: float = 0.50,  # kept for API compat, unused
-    ):
-        self.anchor_transform = anchor_transform
-        self.positive_transform = positive_transform
-        self.sat_datasets: Dict[str, SatChunkDataset] = {}
-        self.samples: List[Tuple[str, int]] = []
-
-        for flight in flights:
-            scale = sat_scales.get(flight, MAP_SCALE_FACTOR)
-            sat_ds = SatChunkDataset(
-                root, flight, chunk_pixels=CHUNK_PIXELS,
-                stride_pixels=TRAIN_STRIDE, scale_factor=scale, transform=None,
-            )
-            self.sat_datasets[flight] = sat_ds
-            self.samples.extend([(flight, i) for i in range(len(sat_ds))])
-
-        print(f"SSL dataset: {len(self.samples)} chunks across {len(flights)} flights (cross-scale pairs)")
-
-    def __len__(self) -> int:
-        return len(self.samples)
-
-    def __getitem__(self, idx: int):
-        flight, chunk_idx = self.samples[idx]
-        sat_ds = self.sat_datasets[flight]
-        img, lat, lon = sat_ds[chunk_idx]
-
-        anchor = self.anchor_transform(img)    # zoomed-in view (UAV-like)
-        positive = self.positive_transform(img)  # full-scale view (satellite-like)
-
-        coords = torch.tensor([lat, lon], dtype=torch.float32)
-        return anchor, positive, coords, coords
-
-
-# -----------------------------------------------------------------------------
 # SSL4EO-S12 training pipeline — parquet-filtered shards, seasonal SSL pairs
 # -----------------------------------------------------------------------------
 
@@ -408,7 +330,6 @@ class VisLocSSLDataModule(pl.LightningDataModule):
         self.train_ds = None
         self.val_uav_ds = None
         self.val_sat_ds = None
-        self._wds_pipeline = False  # True when train_ds is a wds pipeline (batches itself)
 
         self.processor = AutoImageProcessor.from_pretrained(cfg.model_name, trust_remote_code=True)
         mean = self.processor.image_mean
@@ -446,44 +367,28 @@ class VisLocSSLDataModule(pl.LightningDataModule):
 
     def setup(self, stage: str | None = None):
         if self.train_ds is None:
-            ssl4eo_shard_dir = Path(self.cfg.ssl4eo_root) / "train" / "S2RGB"
-            if ssl4eo_shard_dir.exists() and any(ssl4eo_shard_dir.glob("*.tar")):
-                lat_range = (
-                    (self.cfg.ssl4eo_lat_min, self.cfg.ssl4eo_lat_max)
-                    if self.cfg.ssl4eo_lat_min is not None
-                    else None
-                )
-                lon_range = (
-                    (self.cfg.ssl4eo_lon_min, self.cfg.ssl4eo_lon_max)
-                    if self.cfg.ssl4eo_lon_min is not None
-                    else None
-                )
-                self.train_ds = build_ssl4eo_ssl_pipeline(
-                    data_root=self.cfg.ssl4eo_root,
-                    anchor_transform=self.anchor_transform,
-                    positive_transform=self.positive_transform,
-                    lat_range=lat_range,
-                    lon_range=lon_range,
-                    batch_size=self.cfg.batch_size,
-                    shuffle=True,
-                    max_cloud_cover=self.cfg.ssl4eo_max_cloud_cover,
-                    min_brightness=self.cfg.ssl4eo_min_brightness,
-                    seed=self.cfg.seed,
-                )
-                self._wds_pipeline = True
-            else:
-                print(
-                    f"SSL4EO-S12 shards not found at {ssl4eo_shard_dir}; "
-                    "falling back to VisLoc satellite chunks."
-                )
-                self.train_ds = SatSSLDataset(
-                    root=self.root,
-                    flights=TRAIN_FLIGHTS,
-                    sat_scales=SAT_SCALES,
-                    anchor_transform=self.anchor_transform,
-                    positive_transform=self.positive_transform,
-                    iou_pos_threshold=self.cfg.iou_pos_threshold,
-                )
+            lat_range = (
+                (self.cfg.ssl4eo_lat_min, self.cfg.ssl4eo_lat_max)
+                if self.cfg.ssl4eo_lat_min is not None
+                else None
+            )
+            lon_range = (
+                (self.cfg.ssl4eo_lon_min, self.cfg.ssl4eo_lon_max)
+                if self.cfg.ssl4eo_lon_min is not None
+                else None
+            )
+            self.train_ds = build_ssl4eo_ssl_pipeline(
+                data_root=self.cfg.ssl4eo_root,
+                anchor_transform=self.anchor_transform,
+                positive_transform=self.positive_transform,
+                lat_range=lat_range,
+                lon_range=lon_range,
+                batch_size=self.cfg.batch_size,
+                shuffle=True,
+                max_cloud_cover=self.cfg.ssl4eo_max_cloud_cover,
+                min_brightness=self.cfg.ssl4eo_min_brightness,
+                seed=self.cfg.seed,
+            )
 
         if self.val_uav_ds is None or self.val_sat_ds is None:
             val_scale = SAT_SCALES.get(VAL_FLIGHT, MAP_SCALE_FACTOR)
@@ -501,24 +406,14 @@ class VisLocSSLDataModule(pl.LightningDataModule):
             )
 
     def train_dataloader(self):
-        if self._wds_pipeline:
-            # wds pipeline batches itself — DataLoader is just a thin wrapper.
-            return DataLoader(
-                dataset=self.train_ds,
-                batch_size=None,
-                shuffle=False,
-                num_workers=self.cfg.num_workers,
-                pin_memory=True,
-                persistent_workers=self.cfg.num_workers > 0,
-            )
+        # wds pipeline batches itself — DataLoader is just a thin wrapper.
         return DataLoader(
             dataset=self.train_ds,
-            batch_size=self.cfg.batch_size,
-            shuffle=True,
+            batch_size=None,
+            shuffle=False,
             num_workers=self.cfg.num_workers,
             pin_memory=True,
             persistent_workers=self.cfg.num_workers > 0,
-            drop_last=True,
         )
 
     def val_dataloader(self):
@@ -769,7 +664,6 @@ def parse_args() -> Config:
 
     parser.add_argument("--warmup-epochs", type=int, default=Config.warmup_epochs)
     parser.add_argument("--lora-last-n-blocks", type=int, default=Config.lora_last_n_blocks)
-    parser.add_argument("--iou-pos-threshold", type=float, default=Config.iou_pos_threshold)
     parser.add_argument("--wandb-project", type=str, default=Config.wandb_project)
     parser.add_argument("--wandb-run-name", type=str, default=None)
     parser.add_argument("--model-name", type=str, default=DINO_MODEL)
@@ -813,7 +707,6 @@ def parse_args() -> Config:
         precision=args.precision,
         seed=args.seed,
         warmup_epochs=args.warmup_epochs,
-        iou_pos_threshold=args.iou_pos_threshold,
         wandb_project=args.wandb_project,
         wandb_run_name=args.wandb_run_name,
         ssl4eo_root=args.ssl4eo_root,
