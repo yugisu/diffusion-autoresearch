@@ -86,7 +86,7 @@ class Config:
     vicreg_mu: float = 25.0     # variance (prevent collapse)
     vicreg_nu: float = 1.0      # covariance (decorrelate dimensions)
 
-    georank_weight: float = 0.1  # weight for GeoRank regularization (0 = disabled)
+    georank_weight: float = 0.0  # weight for GeoRank regularization (0 = disabled)
     georank_strength: float = 10.0  # soft-rank sharpness (higher → closer to hard rank)
     cosine_t0: int = 0  # CosineAnnealingWarmRestarts period (0 = plain cosine decay)
 
@@ -94,10 +94,12 @@ class Config:
     lora_alpha: float = 32.0
     lora_last_n_blocks: int = 4  # only last N blocks get LoRA (0=all)
 
+    n_ssl_positives: int = 3  # number of positive views per anchor (1=standard pair, 3=all 4 seasons)
+
     max_epochs: int = 25
     max_steps: int = -1
     steps_per_epoch: int = 200  # limit_train_batches; 0 = natural exhaustion
-    time_budget_hours: float = 2.0  # wall-clock budget; 0 = no limit
+    time_budget_hours: float = 3.0  # wall-clock budget; 0 = no limit
     precision: str = "16-mixed"
     seed: int = 42
 
@@ -113,7 +115,7 @@ class Config:
     ssl4eo_min_brightness: float = 30.0  # drop dark ocean/water samples
 
     wandb_project: str = "autoresearch-ssl-dinov3-ssl4eos12"
-    wandb_run_name: str | None = "exp04-vicreg512-china-georank"
+    wandb_run_name: str | None = "exp13-vicreg-multipositives-lorar16"
 
 
 # -----------------------------------------------------------------------------
@@ -223,6 +225,7 @@ def build_ssl4eo_ssl_pipeline(
     seed: int = 42,
     max_cloud_cover: float = 0.5,
     min_brightness: float = 30.0,
+    n_positives: int = 1,
 ):
     """
     Build a WebDataset pipeline for SSL4EO-S12 S2RGB SSL training.
@@ -290,13 +293,28 @@ def build_ssl4eo_ssl_pipeline(
         # Skip ocean / near-black samples (ocean is dark and uniform).
         if min_brightness > 0 and bands.mean() < min_brightness:
             return None
-        T = bands.shape[0]
-        t1, t2 = np.random.choice(T, 2, replace=False).tolist() if T >= 2 else (0, 0)
-        img_a = Image.fromarray(np.transpose(bands[t1], (1, 2, 0)))
-        img_p = Image.fromarray(np.transpose(bands[t2], (1, 2, 0)))
 
+        T = bands.shape[0]
+        n_needed = 1 + n_positives
+        if T >= n_needed:
+            indices = np.random.choice(T, n_needed, replace=False).tolist()
+        else:
+            indices = np.random.choice(T, n_needed, replace=True).tolist()
+        t_anchor = indices[0]
+        t_positives = indices[1:]
+
+        img_a = Image.fromarray(np.transpose(bands[t_anchor], (1, 2, 0)))
         coords = torch.tensor([lat, lon], dtype=torch.float32)
-        return anchor_transform(img_a), positive_transform(img_p), coords, coords
+
+        if n_positives == 1:
+            img_p = Image.fromarray(np.transpose(bands[t_positives[0]], (1, 2, 0)))
+            return anchor_transform(img_a), positive_transform(img_p), coords, coords
+        else:
+            pos_tensors = torch.stack(
+                [positive_transform(Image.fromarray(np.transpose(bands[t], (1, 2, 0)))) for t in t_positives],
+                dim=0,
+            )
+            return anchor_transform(img_a), pos_tensors, coords, coords
 
     return base.map(to_ssl_pair).select(lambda x: x is not None).batched(batch_size, collation_fn=default_collate)
 
@@ -366,6 +384,7 @@ class VisLocSSLDataModule(pl.LightningDataModule):
                 max_cloud_cover=self.cfg.ssl4eo_max_cloud_cover,
                 min_brightness=self.cfg.ssl4eo_min_brightness,
                 seed=self.cfg.seed,
+                n_positives=self.cfg.n_ssl_positives,
             )
 
         if self.val_uav_ds is None or self.val_sat_ds is None:
@@ -554,18 +573,25 @@ class DinoSSLRetriever(pl.LightningModule):
         self._train_start_time = time.time()
 
     def training_step(self, batch, batch_idx):
-        anchor, positive, anchor_coords, pos_coords = batch
+        anchor, positives, anchor_coords, pos_coords = batch
         q = self.encode(anchor)
-        k = self.encode(positive)
+        q_ssl = self.proj_head(q) if self.proj_head is not None else q
 
-        # Use projection head for SSL loss if enabled (backbone CLS used raw at eval)
-        if self.proj_head is not None:
-            q_ssl = self.proj_head(q)
-            k_ssl = self.proj_head(k)
+        if positives.dim() == 4:
+            # Single positive: (N, C, H, W)
+            k = self.encode(positives)
+            k_ssl = self.proj_head(k) if self.proj_head is not None else k
+            vicreg = self._vicreg_loss(q_ssl, k_ssl)
         else:
-            q_ssl, k_ssl = q, k
+            # Multi-positive: (N, n_pos, C, H, W) — average VICReg over all positives
+            n_pos = positives.shape[1]
+            losses = []
+            for i in range(n_pos):
+                k = self.encode(positives[:, i])
+                k_ssl = self.proj_head(k) if self.proj_head is not None else k
+                losses.append(self._vicreg_loss(q_ssl, k_ssl))
+            vicreg = torch.stack(losses).mean()
 
-        vicreg = self._vicreg_loss(q_ssl, k_ssl)
         loss = vicreg
 
         if self.cfg.georank_weight > 0:
@@ -689,6 +715,7 @@ def parse_args() -> Config:
 
     parser.add_argument("--lora-rank", type=int, default=Config.lora_rank)
     parser.add_argument("--lora-alpha", type=float, default=Config.lora_alpha)
+    parser.add_argument("--n-ssl-positives", type=int, default=Config.n_ssl_positives)
     parser.add_argument("--georank-weight", type=float, default=Config.georank_weight)
     parser.add_argument("--georank-strength", type=float, default=Config.georank_strength)
     parser.add_argument("--cosine-t0", type=int, default=Config.cosine_t0)
@@ -748,6 +775,7 @@ def parse_args() -> Config:
         lora_rank=args.lora_rank,
         lora_alpha=args.lora_alpha,
         lora_last_n_blocks=args.lora_last_n_blocks,
+        n_ssl_positives=args.n_ssl_positives,
         georank_weight=args.georank_weight,
         georank_strength=args.georank_strength,
         cosine_t0=args.cosine_t0,
