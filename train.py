@@ -96,6 +96,7 @@ class Config:
     proj_dim: int = 0  # projection head output dim (0 = disabled, use raw CLS for SSL)
 
     georank_weight: float = 0.0  # weight for GeoRank regularization (0 = disabled)
+    georank_strength: float = 10.0  # soft-rank sharpness (higher → closer to hard rank)
     cosine_t0: int = 0  # CosineAnnealingWarmRestarts period (0 = plain cosine decay)
 
     lora_rank: int = 16
@@ -117,8 +118,8 @@ class Config:
     ssl4eo_lat_max: float | None = None
     ssl4eo_lon_min: float | None = None
     ssl4eo_lon_max: float | None = None
-    ssl4eo_max_cloud_cover: float = 0.5   # drop samples cloudy in every season
-    ssl4eo_min_brightness: float = 30.0   # drop dark ocean/water samples
+    ssl4eo_max_cloud_cover: float = 0.5  # drop samples cloudy in every season
+    ssl4eo_min_brightness: float = 30.0  # drop dark ocean/water samples
 
     wandb_project: str = "autoresearch-ssl-dinov3-ssl4eos12"
     wandb_run_name: str | None = "exp01-global-infonce-lora16"
@@ -161,9 +162,7 @@ def apply_lora(model: nn.Module, rank: int = 16, alpha: float = 32.0, last_n_blo
     last_n_blocks: if >0, only apply LoRA to the last N transformer blocks (0 = all blocks).
     """
     for name, module in model.named_modules():
-        if not (isinstance(module, nn.Linear) and any(
-            k in name for k in ("query", "key", "value", "qkv", "q_proj", "k_proj", "v_proj")
-        )):
+        if not (isinstance(module, nn.Linear) and any(k in name for k in ("query", "key", "value", "qkv", "q_proj", "k_proj", "v_proj"))):
             continue
 
         if last_n_blocks > 0:
@@ -211,7 +210,7 @@ class TimeBudgetCallback(pl.Callback):
         elapsed = time.time() - self._start
         if elapsed >= self.budget_seconds:
             print(
-                f"[TimeBudget] {elapsed/3600:.2f}h elapsed ≥ {self.budget_seconds/3600:.1f}h budget. "
+                f"[TimeBudget] {elapsed / 3600:.2f}h elapsed ≥ {self.budget_seconds / 3600:.1f}h budget. "
                 "Setting trainer.should_stop = True."
             )
             trainer.should_stop = True
@@ -308,12 +307,7 @@ def build_ssl4eo_ssl_pipeline(
         coords = torch.tensor([lat, lon], dtype=torch.float32)
         return anchor_transform(img_a), positive_transform(img_p), coords, coords
 
-    return (
-        base
-        .map(to_ssl_pair)
-        .select(lambda x: x is not None)
-        .batched(batch_size, collation_fn=default_collate)
-    )
+    return base.map(to_ssl_pair).select(lambda x: x is not None).batched(batch_size, collation_fn=default_collate)
 
 
 # -----------------------------------------------------------------------------
@@ -350,33 +344,26 @@ class VisLocSSLDataModule(pl.LightningDataModule):
         self.anchor_transform = transforms.Compose(anchor_aug + shared_aug)
         # Positive: full-scale satellite view — satellite is LOWER quality, apply degradation
         # Blur simulates lower satellite resolution; stronger jitter for weather/temporal variation
-        self.positive_transform = transforms.Compose([
-            transforms.RandomResizedCrop(cfg.image_size, scale=(0.75, 1.00), ratio=(0.9, 1.1)),
-            transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0, hue=0),
-            transforms.GaussianBlur(kernel_size=9, sigma=(0.5, 2.0)),
-        ] + shared_aug)
+        self.positive_transform = transforms.Compose(
+            [
+                transforms.RandomResizedCrop(cfg.image_size, scale=(0.75, 1.00), ratio=(0.9, 1.1)),
+                transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0, hue=0),
+                transforms.GaussianBlur(kernel_size=9, sigma=(0.5, 2.0)),
+            ]
+            + shared_aug
+        )
         # Kept for eval (not used for training)
         self.train_transform = self.anchor_transform
-        self.eval_transform = transforms.Compose(
-            [
-                transforms.Resize((cfg.image_size, cfg.image_size)),
-                transforms.ToTensor(),
-                transforms.Normalize(mean=mean, std=std),
-            ]
-        )
+        self.eval_transform = transforms.Compose([
+            transforms.Resize((cfg.image_size, cfg.image_size)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=mean, std=std),
+        ])
 
     def setup(self, stage: str | None = None):
         if self.train_ds is None:
-            lat_range = (
-                (self.cfg.ssl4eo_lat_min, self.cfg.ssl4eo_lat_max)
-                if self.cfg.ssl4eo_lat_min is not None
-                else None
-            )
-            lon_range = (
-                (self.cfg.ssl4eo_lon_min, self.cfg.ssl4eo_lon_max)
-                if self.cfg.ssl4eo_lon_min is not None
-                else None
-            )
+            lat_range = (self.cfg.ssl4eo_lat_min, self.cfg.ssl4eo_lat_max) if self.cfg.ssl4eo_lat_min is not None else None
+            lon_range = (self.cfg.ssl4eo_lon_min, self.cfg.ssl4eo_lon_max) if self.cfg.ssl4eo_lon_min is not None else None
             self.train_ds = build_ssl4eo_ssl_pipeline(
                 data_root=self.cfg.ssl4eo_root,
                 anchor_transform=self.anchor_transform,
@@ -427,6 +414,65 @@ class VisLocSSLDataModule(pl.LightningDataModule):
         uav_loader = DataLoader(self.val_uav_ds, **common)
         sat_loader = DataLoader(self.val_sat_ds, **common)
         return [uav_loader, sat_loader]
+
+
+# -----------------------------------------------------------------------------
+# Losses
+# -----------------------------------------------------------------------------
+
+
+def haversine_distance(lat1, lon1, lat2, lon2):
+    R = 6371.0
+    lat1, lon1, lat2, lon2 = map(lambda x: torch.deg2rad(x.float()), [lat1, lon1, lat2, lon2])
+    dlat = lat2.unsqueeze(0) - lat1.unsqueeze(1)
+    dlon = lon2.unsqueeze(0) - lon1.unsqueeze(1)
+    a = torch.sin(dlat / 2) ** 2 + (torch.cos(lat1.unsqueeze(1)) * torch.cos(lat2.unsqueeze(0)) * torch.sin(dlon / 2) ** 2)
+    return 2 * R * torch.asin(torch.clamp(torch.sqrt(a), 0, 1))
+
+
+def georank_loss(
+    embeddings: torch.Tensor,  # (N, D), L2-normalized
+    lats: torch.Tensor,  # (N,) degrees
+    lons: torch.Tensor,  # (N,) degrees
+    regularization_strength: float = 1.0,
+) -> torch.Tensor:
+    """
+    GeoRank regularization term (Burgert et al., 2026, arXiv:2601.02289).
+
+    Minimizes the Spearman-like rank disagreement between pairwise
+    embedding distances and pairwise spherical geographic distances.
+
+    For each anchor i, soft-ranks all other samples by:
+      - embedding distance (cosine or L2)
+      - geographic (haversine) distance
+    Then penalizes the MSE between the two rank vectors.
+    """
+    N = embeddings.size(0)
+
+    emb_dist = 1.0 - embeddings @ embeddings.T  # (N, N)
+    geo_dist = haversine_distance(lats, lons, lats, lons)
+
+    # Mask diagonal with large value so self-distance ranks last
+    inf = torch.finfo(emb_dist.dtype).max
+    eye = torch.eye(N, dtype=torch.bool, device=embeddings.device)
+    emb_dist = emb_dist.masked_fill(eye, inf)
+    geo_dist = geo_dist.masked_fill(eye, inf)
+
+    # Differentiable soft rank: rank(x)[i] = 1 + Σⱼ σ((x[i]-x[j]) / strength)
+    # Applied per-row: diff[i,j,k] = x[i,j] - x[i,k], sum over k → rank of each j within row i
+    # Previous version: torchsort's soft_rank fn; didn't work because it doesn't support torch 2.3
+    def _soft_rank(x: torch.Tensor) -> torch.Tensor:
+        diff = x.unsqueeze(-1) - x.unsqueeze(-2)
+        return 1.0 + torch.sigmoid(diff * regularization_strength).sum(-1)
+
+    e_ranks = _soft_rank(emb_dist)
+    g_ranks = _soft_rank(geo_dist)
+
+    # Normalize to [0, 1]
+    e_ranks = e_ranks / N
+    g_ranks = g_ranks / N
+
+    return F.mse_loss(e_ranks, g_ranks)
 
 
 # -----------------------------------------------------------------------------
@@ -497,29 +543,12 @@ class DinoSSLRetriever(pl.LightningModule):
         return 0.5 * (loss_qk + loss_kq)
 
     def _georank_loss(self, embs: torch.Tensor, coords: torch.Tensor) -> torch.Tensor:
-        """GeoRank (Burgert et al., WACV 2025): MSE between normalized ordinal ranks.
-
-        For each row i, rank all j by geographic distance (ascending: closest = rank 0)
-        and by embedding similarity (descending: most similar = rank 0), then minimize
-        MSE between the two normalized rank vectors, excluding self-pairs.
-        """
-        B = embs.size(0)
-
-        # Pairwise geographic distances (degrees, flat-earth approx)
-        dlat = coords[:, 0:1] - coords[:, 0:1].T
-        dlon = coords[:, 1:2] - coords[:, 1:2].T
-        geo_dist = torch.sqrt(dlat ** 2 + dlon ** 2 + 1e-8)  # (B, B)
-
-        # Pairwise cosine similarities (embs already L2-normalized)
-        sim = embs @ embs.T  # (B, B)
-
-        # Ordinal ranks via argsort(argsort): geo ascending, sim descending
-        geo_ranks = torch.argsort(torch.argsort(geo_dist, dim=1), dim=1).float()
-        sim_ranks = torch.argsort(torch.argsort(-sim, dim=1), dim=1).float()
-
-        # Normalize to [0, 1] and compare, excluding diagonal (self-pairs, always rank 0)
-        mask = ~torch.eye(B, dtype=torch.bool, device=embs.device)
-        return F.mse_loss(sim_ranks[mask] / (B - 1), geo_ranks[mask] / (B - 1))
+        return georank_loss(
+            embs,
+            lats=coords[:, 0],
+            lons=coords[:, 1],
+            regularization_strength=self.cfg.georank_strength,
+        )
 
     def on_train_start(self):
         self._train_start_time = time.time()
@@ -616,7 +645,9 @@ class DinoSSLRetriever(pl.LightningModule):
                 pos = e % cycle_len
                 # eta_min = 1% of max LR
                 return 0.01 + 0.99 * 0.5 * (1 + math.cos(math.pi * pos / cycle_len))
+
         else:
+
             def lr_lambda(epoch):
                 if epoch < warmup:
                     return (epoch + 1) / warmup
@@ -654,6 +685,7 @@ def parse_args() -> Config:
     parser.add_argument("--lora-rank", type=int, default=Config.lora_rank)
     parser.add_argument("--lora-alpha", type=float, default=Config.lora_alpha)
     parser.add_argument("--georank-weight", type=float, default=Config.georank_weight)
+    parser.add_argument("--georank-strength", type=float, default=Config.georank_strength)
     parser.add_argument("--cosine-t0", type=int, default=Config.cosine_t0)
 
     parser.add_argument("--max-epochs", type=int, default=Config.max_epochs)
@@ -671,18 +703,30 @@ def parse_args() -> Config:
 
     # SSL4EO-S12 options
     parser.add_argument("--ssl4eo-root", type=str, default=str(SSL4EOS12_ROOT))
-    parser.add_argument("--ssl4eo-lat-min", type=float, default=None,
-                        help="Geographic filter: southern latitude bound (e.g. 15.0 for China region)")
-    parser.add_argument("--ssl4eo-lat-max", type=float, default=None,
-                        help="Geographic filter: northern latitude bound (e.g. 55.0 for China region)")
-    parser.add_argument("--ssl4eo-lon-min", type=float, default=None,
-                        help="Geographic filter: western longitude bound (e.g. 90.0 for China region)")
-    parser.add_argument("--ssl4eo-lon-max", type=float, default=None,
-                        help="Geographic filter: eastern longitude bound (e.g. 135.0 for China region)")
-    parser.add_argument("--ssl4eo-max-cloud-cover", type=float, default=Config.ssl4eo_max_cloud_cover,
-                        help="Drop samples where min cloud cover across seasons exceeds this (0–1)")
-    parser.add_argument("--ssl4eo-min-brightness", type=float, default=Config.ssl4eo_min_brightness,
-                        help="Drop samples with mean pixel value below this (catches ocean/dark water)")
+    parser.add_argument(
+        "--ssl4eo-lat-min", type=float, default=None, help="Geographic filter: southern latitude bound (e.g. 15.0 for China region)"
+    )
+    parser.add_argument(
+        "--ssl4eo-lat-max", type=float, default=None, help="Geographic filter: northern latitude bound (e.g. 55.0 for China region)"
+    )
+    parser.add_argument(
+        "--ssl4eo-lon-min", type=float, default=None, help="Geographic filter: western longitude bound (e.g. 90.0 for China region)"
+    )
+    parser.add_argument(
+        "--ssl4eo-lon-max", type=float, default=None, help="Geographic filter: eastern longitude bound (e.g. 135.0 for China region)"
+    )
+    parser.add_argument(
+        "--ssl4eo-max-cloud-cover",
+        type=float,
+        default=Config.ssl4eo_max_cloud_cover,
+        help="Drop samples where min cloud cover across seasons exceeds this (0–1)",
+    )
+    parser.add_argument(
+        "--ssl4eo-min-brightness",
+        type=float,
+        default=Config.ssl4eo_min_brightness,
+        help="Drop samples with mean pixel value below this (catches ocean/dark water)",
+    )
 
     args = parser.parse_args()
 
@@ -700,6 +744,7 @@ def parse_args() -> Config:
         lora_alpha=args.lora_alpha,
         lora_last_n_blocks=args.lora_last_n_blocks,
         georank_weight=args.georank_weight,
+        georank_strength=args.georank_strength,
         cosine_t0=args.cosine_t0,
         max_epochs=args.max_epochs,
         max_steps=args.max_steps,
@@ -735,9 +780,9 @@ def main():
     ssl4eo_shard_dir = Path(cfg.ssl4eo_root) / "train" / "S2RGB"
     n_shards = len(list(ssl4eo_shard_dir.glob("*.tar"))) if ssl4eo_shard_dir.exists() else 0
     geo_filter = (
-        f"lat [{cfg.ssl4eo_lat_min}, {cfg.ssl4eo_lat_max}], "
-        f"lon [{cfg.ssl4eo_lon_min}, {cfg.ssl4eo_lon_max}]"
-        if cfg.ssl4eo_lat_min is not None else "global (no filter)"
+        f"lat [{cfg.ssl4eo_lat_min}, {cfg.ssl4eo_lat_max}], lon [{cfg.ssl4eo_lon_min}, {cfg.ssl4eo_lon_max}]"
+        if cfg.ssl4eo_lat_min is not None
+        else "global (no filter)"
     )
     print(f"SSL4EO-S12 shards: {n_shards}  |  geo filter: {geo_filter}")
     print(f"Val flight: {VAL_FLIGHT} (VisLoc UAV queries → satellite gallery)")
@@ -755,7 +800,7 @@ def main():
     # Count trainable params
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total = sum(p.numel() for p in model.parameters())
-    print(f"Trainable params: {trainable:,} / {total:,} ({100*trainable/total:.2f}%)")
+    print(f"Trainable params: {trainable:,} / {total:,} ({100 * trainable / total:.2f}%)")
 
     wandb_logger = WandbLogger(
         project=cfg.wandb_project,
