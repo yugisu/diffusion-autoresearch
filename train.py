@@ -802,7 +802,7 @@ def main():
         mode="max",
         save_top_k=1,
     )
-    early_stop_cb = EarlyStopping(monitor="val/R@1", mode="max", patience=5)
+    early_stop_cb = EarlyStopping(monitor="val/R@1", mode="max", patience=5, check_on_train_epoch_end=False)
     callbacks = [ckpt_cb, early_stop_cb]
     if cfg.time_budget_hours > 0:
         callbacks.append(TimeBudgetCallback(cfg.time_budget_hours))
