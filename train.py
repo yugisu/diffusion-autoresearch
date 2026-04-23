@@ -391,17 +391,9 @@ class VisLocSSLDataModule(pl.LightningDataModule):
             persistent_workers=self.cfg.num_workers > 0,
         )
 
-    def val_dataloader(self):
-        common = dict(
-            batch_size=self.cfg.eval_batch_size,
-            shuffle=False,
-            num_workers=self.cfg.num_workers,
-            pin_memory=True,
-            persistent_workers=self.cfg.num_workers > 0,
-        )
-        uav_loader = DataLoader(self.val_uav_ds, **common)
-        sat_loader = DataLoader(self.val_sat_ds, **common)
-        return [uav_loader, sat_loader]
+    # val_dataloader intentionally absent: PL 2.6 + IterableDataset interaction
+    # prevents epoch-end validation from firing. Evaluation is done manually
+    # in DinoSSLRetriever.on_train_epoch_end via _eval_retrieval().
 
 
 # -----------------------------------------------------------------------------
@@ -507,9 +499,6 @@ class DinoSSLRetriever(pl.LightningModule):
         else:
             self.proj_head = None
 
-        self._val_uav_embs = []
-        self._val_sat_embs = []
-        self._val_uav_coords = []
         self._total_samples_seen = 0
         self._train_start_time = None
 
@@ -571,47 +560,50 @@ class DinoSSLRetriever(pl.LightningModule):
         self.log("train/samples_per_sec", self._total_samples_seen / max(elapsed, 1), on_step=True, on_epoch=False)
         return loss
 
-    def on_validation_epoch_start(self):
-        self._val_uav_embs = []
-        self._val_sat_embs = []
-        self._val_uav_coords = []
+    @torch.no_grad()
+    def _eval_retrieval(self) -> dict:
+        """Manual retrieval eval — bypasses PL's validation loop entirely."""
+        dm = self.trainer.datamodule
+        if dm.val_uav_ds is None or dm.val_sat_ds is None:
+            return {}
+        was_training = self.training
+        self.eval()
+        kw = dict(batch_size=self.cfg.eval_batch_size, num_workers=4, pin_memory=True)
 
-    def validation_step(self, batch, batch_idx, dataloader_idx=0):
-        imgs, lat, lon = batch
+        uav_embs, uav_coords = [], []
+        for imgs, lat, lon in DataLoader(dm.val_uav_ds, **kw):
+            uav_embs.append(self.encode(imgs.to(self.device)).cpu())
+            uav_coords.append(torch.stack([lat, lon], dim=1).cpu())
 
-        if dataloader_idx == 0:  # UAV queries
-            emb = self.encode(imgs)
-            self._val_uav_embs.append(emb.detach().cpu())
-            coords = torch.stack([lat, lon], dim=1)
-            self._val_uav_coords.append(coords.detach().cpu())
-        else:  # satellite gallery — TTA over 4 rotations
+        sat_embs = []
+        for imgs, _, _ in DataLoader(dm.val_sat_ds, **kw):
+            imgs = imgs.to(self.device)
             e0 = self.encode(imgs)
             e1 = self.encode(torch.rot90(imgs, 1, [2, 3]))
             e2 = self.encode(torch.rot90(imgs, 2, [2, 3]))
             e3 = self.encode(torch.rot90(imgs, 3, [2, 3]))
-            emb = F.normalize((e0 + e1 + e2 + e3) / 4.0, dim=-1)
-            self._val_sat_embs.append(emb.detach().cpu())
+            sat_embs.append(F.normalize((e0 + e1 + e2 + e3) / 4.0, dim=-1).cpu())
 
-    def on_validation_epoch_end(self):
-        if len(self._val_uav_embs) == 0 or len(self._val_sat_embs) == 0:
+        if was_training:
+            self.train()
+
+        uav_e = torch.cat(uav_embs, 0).numpy().astype(np.float32)
+        sat_e = torch.cat(sat_embs, 0).numpy().astype(np.float32)
+        coords = torch.cat(uav_coords, 0).numpy().astype(np.float32)
+        return evaluate_r1(uav_e, sat_e, coords, dm.val_sat_ds.chunk_bboxes)
+
+    def on_train_epoch_end(self):
+        metrics = self._eval_retrieval()
+        if not metrics:
             return
-
-        uav_embs = torch.cat(self._val_uav_embs, dim=0).numpy().astype(np.float32)
-        sat_embs = torch.cat(self._val_sat_embs, dim=0).numpy().astype(np.float32)
-        uav_coords = torch.cat(self._val_uav_coords, dim=0).numpy().astype(np.float32)
-
-        val_sat_ds = self.trainer.datamodule.val_sat_ds
-        metrics = evaluate_r1(uav_embs, sat_embs, uav_coords, val_sat_ds.chunk_bboxes)
-
-        self.log("val/R@1", float(metrics["R@1"]), prog_bar=True, sync_dist=False)
-        self.log("val/R@5", float(metrics["R@5"]), prog_bar=False, sync_dist=False)
-        self.log("val/R@10", float(metrics["R@10"]), prog_bar=False, sync_dist=False)
-
+        r1, r5, r10 = float(metrics["R@1"]), float(metrics["R@5"]), float(metrics["R@10"])
+        self.log("val/R@1", r1, prog_bar=True, sync_dist=False)
+        self.log("val/R@5", r5, prog_bar=False, sync_dist=False)
+        self.log("val/R@10", r10, prog_bar=False, sync_dist=False)
         elapsed = time.time() - self._train_start_time if self._train_start_time else 0
-        gap = 0.90 - float(metrics["R@1"])
         print(
-            f"[VAL flight {VAL_FLIGHT}] R@1={metrics['R@1']:.4f} R@5={metrics['R@5']:.4f} R@10={metrics['R@10']:.4f}"
-            f" | gap_to_90={gap:.4f} | elapsed={elapsed:.0f}s | samples_seen={self._total_samples_seen}"
+            f"\n[VAL flight {VAL_FLIGHT}] R@1={r1:.4f} R@5={r5:.4f} R@10={r10:.4f}"
+            f" | gap_to_90={0.90 - r1:.4f} | elapsed={elapsed:.0f}s | samples_seen={self._total_samples_seen}"
         )
 
     def configure_optimizers(self):
@@ -801,8 +793,9 @@ def main():
         monitor="val/R@1",
         mode="max",
         save_top_k=1,
+        save_on_train_epoch_end=True,
     )
-    early_stop_cb = EarlyStopping(monitor="val/R@1", mode="max", patience=5, check_on_train_epoch_end=False)
+    early_stop_cb = EarlyStopping(monitor="val/R@1", mode="max", patience=5, check_on_train_epoch_end=True)
     callbacks = [ckpt_cb, early_stop_cb]
     if cfg.time_budget_hours > 0:
         callbacks.append(TimeBudgetCallback(cfg.time_budget_hours))
@@ -814,8 +807,6 @@ def main():
         max_epochs=cfg.max_epochs,
         max_steps=cfg.max_steps,
         limit_train_batches=limit_train_batches,
-        check_val_every_n_epoch=1,  # explicit: validate after every training epoch
-        num_sanity_val_steps=0,     # skip sanity check; it obscures the first real val
         precision=cfg.precision,
         logger=wandb_logger,
         callbacks=callbacks,
