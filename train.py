@@ -83,7 +83,7 @@ class Config:
     warmup_epochs: int = 2
     proj_dim: int = 0  # projection head output dim (0 = disabled, use raw CLS for SSL)
 
-    georank_weight: float = 0.0  # weight for GeoRank regularization (0 = disabled)
+    georank_weight: float = 0.1  # weight for GeoRank regularization (0 = disabled)
     georank_strength: float = 10.0  # soft-rank sharpness (higher → closer to hard rank)
     cosine_t0: int = 0  # CosineAnnealingWarmRestarts period (0 = plain cosine decay)
 
@@ -91,9 +91,9 @@ class Config:
     lora_alpha: float = 32.0
     lora_last_n_blocks: int = 4  # only last N blocks get LoRA (0=all)
 
-    max_epochs: int = 7
+    max_epochs: int = 25
     max_steps: int = -1
-    steps_per_epoch: int = 500  # limit_train_batches; 0 = natural exhaustion
+    steps_per_epoch: int = 200  # limit_train_batches; 0 = natural exhaustion
     time_budget_hours: float = 2.0  # wall-clock budget; 0 = no limit
     precision: str = "16-mixed"
     seed: int = 42
@@ -101,16 +101,16 @@ class Config:
     # SSL4EO-S12 training data
     ssl4eo_root: str = str(SSL4EOS12_ROOT)
     # Optional geographic bounding-box filter (degrees).  None = global.
-    # VisLoc flights are in China; set to (15, 55) / (90, 135) to focus there.
-    ssl4eo_lat_min: float | None = None
-    ssl4eo_lat_max: float | None = None
-    ssl4eo_lon_min: float | None = None
-    ssl4eo_lon_max: float | None = None
+    # VisLoc flights are in China; (15, 55) / (90, 135) matches the target domain.
+    ssl4eo_lat_min: float | None = 15.0
+    ssl4eo_lat_max: float | None = 55.0
+    ssl4eo_lon_min: float | None = 90.0
+    ssl4eo_lon_max: float | None = 135.0
     ssl4eo_max_cloud_cover: float = 0.5  # drop samples cloudy in every season
     ssl4eo_min_brightness: float = 30.0  # drop dark ocean/water samples
 
     wandb_project: str = "autoresearch-ssl-dinov3-ssl4eos12"
-    wandb_run_name: str | None = "exp01-global-infonce-lora16"
+    wandb_run_name: str | None = "exp02-china-georank-infonce"
 
 
 # -----------------------------------------------------------------------------
@@ -692,16 +692,16 @@ def parse_args() -> Config:
     # SSL4EO-S12 options
     parser.add_argument("--ssl4eo-root", type=str, default=str(SSL4EOS12_ROOT))
     parser.add_argument(
-        "--ssl4eo-lat-min", type=float, default=None, help="Geographic filter: southern latitude bound (e.g. 15.0 for China region)"
+        "--ssl4eo-lat-min", type=float, default=Config.ssl4eo_lat_min, help="Geographic filter: southern latitude bound"
     )
     parser.add_argument(
-        "--ssl4eo-lat-max", type=float, default=None, help="Geographic filter: northern latitude bound (e.g. 55.0 for China region)"
+        "--ssl4eo-lat-max", type=float, default=Config.ssl4eo_lat_max, help="Geographic filter: northern latitude bound"
     )
     parser.add_argument(
-        "--ssl4eo-lon-min", type=float, default=None, help="Geographic filter: western longitude bound (e.g. 90.0 for China region)"
+        "--ssl4eo-lon-min", type=float, default=Config.ssl4eo_lon_min, help="Geographic filter: western longitude bound"
     )
     parser.add_argument(
-        "--ssl4eo-lon-max", type=float, default=None, help="Geographic filter: eastern longitude bound (e.g. 135.0 for China region)"
+        "--ssl4eo-lon-max", type=float, default=Config.ssl4eo_lon_max, help="Geographic filter: eastern longitude bound"
     )
     parser.add_argument(
         "--ssl4eo-max-cloud-cover",
