@@ -81,7 +81,10 @@ class Config:
     weight_decay: float = 1e-4
     temperature: float = 0.07
     warmup_epochs: int = 2
-    proj_dim: int = 0  # projection head output dim (0 = disabled, use raw CLS for SSL)
+    proj_dim: int = 512  # VICReg projection head dim (0 = disabled)
+    vicreg_lambda: float = 25.0  # invariance (MSE between views)
+    vicreg_mu: float = 25.0     # variance (prevent collapse)
+    vicreg_nu: float = 1.0      # covariance (decorrelate dimensions)
 
     georank_weight: float = 0.1  # weight for GeoRank regularization (0 = disabled)
     georank_strength: float = 10.0  # soft-rank sharpness (higher → closer to hard rank)
@@ -110,7 +113,7 @@ class Config:
     ssl4eo_min_brightness: float = 30.0  # drop dark ocean/water samples
 
     wandb_project: str = "autoresearch-ssl-dinov3-ssl4eos12"
-    wandb_run_name: str | None = "exp02-china-georank-infonce"
+    wandb_run_name: str | None = "exp04-vicreg512-china-georank"
 
 
 # -----------------------------------------------------------------------------
@@ -463,8 +466,9 @@ def georank_loss(
 class ProjectionHead(nn.Module):
     """2-layer MLP projection head used only during SSL training (discarded at eval)."""
 
-    def __init__(self, in_dim: int, out_dim: int):
+    def __init__(self, in_dim: int, out_dim: int, normalize: bool = False):
         super().__init__()
+        self.normalize = normalize
         self.net = nn.Sequential(
             nn.Linear(in_dim, in_dim),
             nn.BatchNorm1d(in_dim),
@@ -473,7 +477,8 @@ class ProjectionHead(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return F.normalize(self.net(x), dim=-1)
+        h = self.net(x)
+        return F.normalize(h, dim=-1) if self.normalize else h
 
 
 # -----------------------------------------------------------------------------
@@ -519,6 +524,24 @@ class DinoSSLRetriever(pl.LightningModule):
         loss_kq = F.cross_entropy(logits.t(), labels)
         return 0.5 * (loss_qk + loss_kq)
 
+    def _vicreg_loss(self, z1: torch.Tensor, z2: torch.Tensor) -> torch.Tensor:
+        """VICReg loss (Bardes et al., 2022). z1/z2 must NOT be L2-normalized."""
+        N, D = z1.shape
+        # Invariance: MSE between projections of two views
+        sim = F.mse_loss(z1, z2)
+        # Variance: push std of each dim above 1
+        std1 = torch.sqrt(z1.var(dim=0) + 1e-4)
+        std2 = torch.sqrt(z2.var(dim=0) + 1e-4)
+        var = torch.mean(F.relu(1.0 - std1)) + torch.mean(F.relu(1.0 - std2))
+        # Covariance: penalise off-diagonal correlations (decorrelate dims)
+        z1c = z1 - z1.mean(dim=0)
+        z2c = z2 - z2.mean(dim=0)
+        cov1 = (z1c.T @ z1c) / (N - 1)
+        cov2 = (z2c.T @ z2c) / (N - 1)
+        eye = torch.eye(D, device=z1.device, dtype=torch.bool)
+        cov = (cov1[~eye].pow(2).sum() + cov2[~eye].pow(2).sum()) / D
+        return self.cfg.vicreg_lambda * sim + self.cfg.vicreg_mu * var + self.cfg.vicreg_nu * cov
+
     def _georank_loss(self, embs: torch.Tensor, coords: torch.Tensor) -> torch.Tensor:
         return georank_loss(
             embs,
@@ -542,13 +565,15 @@ class DinoSSLRetriever(pl.LightningModule):
         else:
             q_ssl, k_ssl = q, k
 
-        infonce = self._infonce_loss(q_ssl, k_ssl)
-        loss = infonce
+        vicreg = self._vicreg_loss(q_ssl, k_ssl)
+        loss = vicreg
 
         if self.cfg.georank_weight > 0:
             gr = self._georank_loss(q, anchor_coords.to(q.device))
-            loss = infonce + self.cfg.georank_weight * gr
+            loss = vicreg + self.cfg.georank_weight * gr
             self.log("train/georank_loss", gr, on_step=True, on_epoch=False)
+
+        self.log("train/vicreg_loss", vicreg, on_step=True, on_epoch=False)
 
         bs = anchor.size(0)
         self._total_samples_seen += bs
