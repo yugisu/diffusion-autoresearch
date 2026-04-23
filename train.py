@@ -47,6 +47,7 @@ from prepare import (
     CHUNK_PIXELS,
     CHUNK_STRIDE,
     MAP_SCALE_FACTOR,
+    SAT_SCALES,
     SSL4EOS12_ROOT,
     VISLOC_ROOT,
     SatChunkDataset,
@@ -63,19 +64,6 @@ torch.set_float32_matmul_precision("high")
 
 DINO_MODEL = "facebook/dinov3-vitb16-pretrain-lvd1689m"
 VAL_FLIGHT = "03"
-
-SAT_SCALES = {
-    "01": 0.25,
-    "02": 0.25,
-    "03": 0.25,
-    "04": 0.25,
-    "05": 0.40,
-    "06": 0.60,
-    "08": 0.35,
-    "09": 0.25,
-    "10": 0.50,
-    "11": 0.25,
-}
 
 
 @dataclass
@@ -105,7 +93,7 @@ class Config:
 
     max_epochs: int = 7
     max_steps: int = -1
-    steps_per_epoch: int = 1000  # limit_train_batches; 0 = natural exhaustion
+    steps_per_epoch: int = 500  # limit_train_batches; 0 = natural exhaustion
     time_budget_hours: float = 2.0  # wall-clock budget; 0 = no limit
     precision: str = "16-mixed"
     seed: int = 42

@@ -6,7 +6,7 @@ This is an experiment to have the LLM do its own research.
 
 To set up a new experiment, work with the user to:
 
-1. **Agree on a run tag**: propose a tag based on today's date (e.g. `apr17`). The branch `autoresearch/<tag>` must not already exist — this is a fresh run.
+1. **Agree on a run tag**: propose a tag based on today's date (e.g. `apr17`). The branch `autoresearch/<tag>` must not already exist — this is a fresh run. For this run, use the current `autoresesarch/self-supervised-dinov3-ssl4eo` branch.
 2. **Create the branch**: `git checkout -b autoresearch/<tag>` from current main/master.
 3. **Read the in-scope files**: The repo is small. Read these files for full context:
    - `README.md` — repository context.
@@ -44,7 +44,7 @@ Task details:
 Satellite scale priors (usable with SatChunkDataset if adding VisLoc chunks to training):
 
 ```python
-sat_scales = {"01": 0.25,"02": 0.25,"03": 0.25,"04": 0.25,"05": 0.4,"06": 0.6,"08": 0.35,"09": 0.25,"10": 0.5,"11": 0.25,}
+sat_scales = {"01": 0.25, "02": 0.25, "03": 0.25, "04": 0.25, "05": 0.4, "06": 0.6, "08": 0.35, "09": 0.25, "10": 0.5, "11": 0.25}
 ```
 
 ### Evaluation protocol
@@ -83,8 +83,8 @@ Explore freely — there is no prescribed order. Design experiments based on wha
 These findings from the literature should guide experiment design:
 
 - **Smarter pair construction >> more data or architecture changes.** The biggest wins come from what counts as positive, what's a true hard negative, and how to weight ambiguous pairs (GeoRank, Sample4Geo, Semivariogram reweighting papers).
-- **False negative danger**: Geographically close chunks that look similar are likely false negatives, not hard negatives. Naive hard negative mining based on visual similarity alone will incorrectly push apart representations of genuinely related locations (Semivariogram paper, 2025).
 - **GeoRank** (Burgert et al., WACV 2025): Rank-based geographic regularization validated with DINO. Adds an MSE loss between embedding similarity ranks and geographic distance ranks. Framework-agnostic, consistent gains.
+- **False negative danger**: Geographically close chunks that look similar are likely false negatives, not hard negatives. Naive hard negative mining based on visual similarity alone will incorrectly push apart representations of genuinely related locations (Semivariogram paper, 2025).
 - **Dataset size**: SSL performance saturates at 100-200k images (GeoRank). DINO-MC matched SeCo (1M images) with only 100k. The ~100k chunks from denser stride should be sufficient.
 - **GSD encoding** (Scale-MAE, WaveMAE): Encoding ground sample distance into positional embeddings improves performance when mixing scales. At a single fixed scale, less relevant.
 
@@ -163,6 +163,7 @@ A prior supervised training run fine-tuned DINOv3 on UAV-satellite pairs with mu
 - **Full backbone fine-tuning with LLRD beats partial freezing**: 3-tier LR (5e-6 / 1e-5 / 2e-5 / 5e-5 for head)
 - **What failed**: GeM pooling, asymmetric heads, register token concatenation, RandomResizedCrop on UAV, larger batch sizes (96 > 64 was worse)
 - **R@10=0.9167**: The model finds the right area but struggles to rank the exact chunk #1
+- **R@10 shaping the latent space**: pay attention to the R@10 metric as well
 
 ### Dataset description
 
