@@ -111,7 +111,7 @@ class Config:
     iou_pos_threshold: float = 0.50
     iou_neg_threshold: float = 0.0  # IoU == 0 → negative
 
-    max_epochs: int = 13
+    max_epochs: int = 7
     max_steps: int = -1
     steps_per_epoch: int = 1000  # limit_train_batches; 0 = natural exhaustion
     time_budget_hours: float = 2.0  # wall-clock budget; 0 = no limit
@@ -126,6 +126,8 @@ class Config:
     ssl4eo_lat_max: float | None = None
     ssl4eo_lon_min: float | None = None
     ssl4eo_lon_max: float | None = None
+    ssl4eo_max_cloud_cover: float = 0.5   # drop samples cloudy in every season
+    ssl4eo_min_brightness: float = 30.0   # drop dark ocean/water samples
 
     wandb_project: str = "autoresearch-ssl-dinov3-ssl4eos12"
     wandb_run_name: str | None = "exp01-global-infonce-lora16"
@@ -307,6 +309,8 @@ def build_ssl4eo_ssl_pipeline(
     batch_size: int = 128,
     shuffle: bool = True,
     seed: int = 42,
+    max_cloud_cover: float = 0.5,
+    min_brightness: float = 30.0,
 ):
     """
     Build a WebDataset pipeline for SSL4EO-S12 S2RGB SSL training.
@@ -331,6 +335,10 @@ def build_ssl4eo_ssl_pipeline(
         meta = meta[meta["center_lat"].between(*lat_range)]
     if lon_range is not None:
         meta = meta[meta["center_lon"].between(*lon_range)]
+    # Drop samples that are heavily clouded in every season (no usable timestamp).
+    cloud_cols = [c for c in meta.columns if c.startswith("cloud_cover_")]
+    if cloud_cols and max_cloud_cover < 1.0:
+        meta = meta[meta[cloud_cols].min(axis=1) <= max_cloud_cover]
 
     shard_names = sorted(meta["tar"].unique())
     shard_urls = [str(root / "train" / "S2RGB" / f) for f in shard_names]
@@ -338,7 +346,8 @@ def build_ssl4eo_ssl_pipeline(
 
     geo_str = f"lat {lat_range}, lon {lon_range}" if lat_range else "global"
     print(
-        f"SSL4EO-S12: {len(shard_urls)} shards, {n_samples:,} samples | {geo_str}"
+        f"SSL4EO-S12: {len(shard_urls)} shards, {n_samples:,} samples | {geo_str} | "
+        f"max_cloud={max_cloud_cover} min_brightness={min_brightness}"
     )
 
     # Base pipeline: decode zarr with metadata → sample["image"] = (4,3,264,264)
@@ -366,6 +375,9 @@ def build_ssl4eo_ssl_pipeline(
             return None
 
         bands = sample["image"]  # (T, 3, 264, 264) uint8
+        # Skip ocean / near-black samples (ocean is dark and uniform).
+        if min_brightness > 0 and bands.mean() < min_brightness:
+            return None
         T = bands.shape[0]
         t1, t2 = np.random.choice(T, 2, replace=False).tolist() if T >= 2 else (0, 0)
         img_a = Image.fromarray(np.transpose(bands[t1], (1, 2, 0)))
@@ -454,6 +466,8 @@ class VisLocSSLDataModule(pl.LightningDataModule):
                     lon_range=lon_range,
                     batch_size=self.cfg.batch_size,
                     shuffle=True,
+                    max_cloud_cover=self.cfg.ssl4eo_max_cloud_cover,
+                    min_brightness=self.cfg.ssl4eo_min_brightness,
                     seed=self.cfg.seed,
                 )
                 self._wds_pipeline = True
@@ -770,6 +784,10 @@ def parse_args() -> Config:
                         help="Geographic filter: western longitude bound (e.g. 90.0 for China region)")
     parser.add_argument("--ssl4eo-lon-max", type=float, default=None,
                         help="Geographic filter: eastern longitude bound (e.g. 135.0 for China region)")
+    parser.add_argument("--ssl4eo-max-cloud-cover", type=float, default=Config.ssl4eo_max_cloud_cover,
+                        help="Drop samples where min cloud cover across seasons exceeds this (0–1)")
+    parser.add_argument("--ssl4eo-min-brightness", type=float, default=Config.ssl4eo_min_brightness,
+                        help="Drop samples with mean pixel value below this (catches ocean/dark water)")
 
     args = parser.parse_args()
 
@@ -803,6 +821,8 @@ def parse_args() -> Config:
         ssl4eo_lat_max=args.ssl4eo_lat_max,
         ssl4eo_lon_min=args.ssl4eo_lon_min,
         ssl4eo_lon_max=args.ssl4eo_lon_max,
+        ssl4eo_max_cloud_cover=args.ssl4eo_max_cloud_cover,
+        ssl4eo_min_brightness=args.ssl4eo_min_brightness,
     )
     return cfg
 
