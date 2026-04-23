@@ -497,28 +497,29 @@ class DinoSSLRetriever(pl.LightningModule):
         return 0.5 * (loss_qk + loss_kq)
 
     def _georank_loss(self, embs: torch.Tensor, coords: torch.Tensor) -> torch.Tensor:
-        """GeoRank: MSE between normalized geographic distance ranks and embedding similarity ranks.
+        """GeoRank (Burgert et al., WACV 2025): MSE between normalized ordinal ranks.
 
-        Burgert et al. WACV 2025: rank-preservation regularization that ties embedding
-        space ordering to geographic ordering.
+        For each row i, rank all j by geographic distance (ascending: closest = rank 0)
+        and by embedding similarity (descending: most similar = rank 0), then minimize
+        MSE between the two normalized rank vectors, excluding self-pairs.
         """
+        B = embs.size(0)
+
         # Pairwise geographic distances (degrees, flat-earth approx)
         dlat = coords[:, 0:1] - coords[:, 0:1].T
         dlon = coords[:, 1:2] - coords[:, 1:2].T
-        geo_dist = torch.sqrt(dlat ** 2 + dlon ** 2 + 1e-10)  # (B, B)
+        geo_dist = torch.sqrt(dlat ** 2 + dlon ** 2 + 1e-8)  # (B, B)
 
         # Pairwise cosine similarities (embs already L2-normalized)
-        sim = embs @ embs.T  # (B, B), in [-1, 1]
+        sim = embs @ embs.T  # (B, B)
 
-        # Normalize both to [0, 1] for rank comparison
-        # geo: small dist → 0, large dist → 1
-        geo_norm = geo_dist / (geo_dist.max() + 1e-8)
-        # sim: large sim → 0 (close), small sim → 1 (far)
-        sim_norm = 1.0 - (sim - sim.min()) / (sim.max() - sim.min() + 1e-8)
+        # Ordinal ranks via argsort(argsort): geo ascending, sim descending
+        geo_ranks = torch.argsort(torch.argsort(geo_dist, dim=1), dim=1).float()
+        sim_ranks = torch.argsort(torch.argsort(-sim, dim=1), dim=1).float()
 
-        # Exclude diagonal (self-pairs)
-        mask = ~torch.eye(embs.size(0), dtype=torch.bool, device=embs.device)
-        return F.mse_loss(sim_norm[mask], geo_norm[mask])
+        # Normalize to [0, 1] and compare, excluding diagonal (self-pairs, always rank 0)
+        mask = ~torch.eye(B, dtype=torch.bool, device=embs.device)
+        return F.mse_loss(sim_ranks[mask] / (B - 1), geo_ranks[mask] / (B - 1))
 
     def on_train_start(self):
         self._train_start_time = time.time()
