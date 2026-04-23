@@ -814,6 +814,8 @@ def main():
         max_epochs=cfg.max_epochs,
         max_steps=cfg.max_steps,
         limit_train_batches=limit_train_batches,
+        check_val_every_n_epoch=1,  # explicit: validate after every training epoch
+        num_sanity_val_steps=0,     # skip sanity check; it obscures the first real val
         precision=cfg.precision,
         logger=wandb_logger,
         callbacks=callbacks,
