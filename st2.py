@@ -4,14 +4,16 @@ Stage-2 supervised fine-tuning on top of the best SSL4EO-S12 SSL checkpoint.
 Backbone: loaded from SSL checkpoint (LoRA merged into weights), then fully
           unfrozen with 4-tier LLRD.
 Training: multi-positive InfoNCE + GPS exclusion zone (60m pos / 60-150m ignored)
-          + TwoFlightBatchSampler k_flights=3 + CosineAnnealingWarmRestarts T_0=10
+          + TwoFlightBatchSampler k_flights=3 + CosineAnnealingWarmRestarts T_0=20
           + grad_clip=1.0 + head lr=2e-5.
 
-Exp2 adds on top of Exp1 baseline:
-  - RandomRotation(degrees=180) added to UAV training aug → backbone learns
-    rotation-invariant UAV features (drones fly arbitrary headings)
-  - UAV TTA at inference: 4-rotation average (same as satellite TTA), enabled
-    because training now provides consistent rotated views
+Exp6 changes on top of Exp2 baseline:
+  - T_0=20 (single cosine descent over full 20-epoch budget, no restart)
+    Avoids the destructive LR spike at epoch 10 that reference experiments showed
+    overshoots the converged basin. T_0=20 with max_epochs=25 means one smooth
+    descent from η_max to η_min; the restart fires at epoch 20 outside the training.
+  - max_epochs=25 to allow model to find its basin past the T_0=10 peak region.
+  - Keeps exp2: RandomRotation(180) UAV aug + UAV 4-rotation TTA at inference.
 
 Baseline config encodes all findings from the reference two-stage branch (Exp9):
   - GPS exclusion zone is the single largest gain (+0.78 pp R@1)
@@ -163,7 +165,7 @@ class Config:
     weight_decay: float = 1e-4
     temperature: float = 0.07
 
-    max_epochs: int = 20
+    max_epochs: int = 25
     max_steps: int = -1
     precision: str = "16-mixed"
     seed: int = 42
@@ -519,7 +521,7 @@ class DinoCrossViewRetrieverST2(pl.LightningModule):
         optimizer = AdamW(param_groups, weight_decay=self.cfg.weight_decay)
 
         train_batches = max(len(self.trainer.datamodule.train_dataloader()), 1)
-        T_0 = 10 * train_batches  # 10-epoch cycle (2 cycles over 20 epochs)
+        T_0 = 20 * train_batches  # 20-epoch cycle — single cosine descent, no restart within budget
         scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=T_0, T_mult=1, eta_min=2e-5 * 0.05)
         return {
             "optimizer": optimizer,
