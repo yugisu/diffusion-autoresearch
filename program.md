@@ -4,104 +4,70 @@ This is an experiment to have the LLM do its own research.
 
 ## Setup
 
-To set up a new experiment, work with the user to:
+Branch: **`autoresearch/st2-dinov3-ssl4eo`**
 
-1. **Agree on a run tag**: propose a tag based on today's date (e.g. `apr17`). The branch `autoresearch/<tag>` must not already exist — this is a fresh run. For this run, use the current `autoresesarch/self-supervised-dinov3-ssl4eo` branch.
-2. **Create the branch**: `git checkout -b autoresearch/<tag>` from current main/master.
-3. **Read the in-scope files**: The repo is small. Read these files for full context:
-   - `README.md` — repository context.
-   - `prepare.py` — fixed constants, dataset loading, and fixed evaluation. Do not modify.
-   - `train.py` — the file you modify. Model, optimizer, training loop.
-4. **Verify data exists**: Check that VisLoc data exists at `VISLOC_ROOT` (default from `prepare.py`). If missing, tell the human to run data preparation first.
-5. **Initialize results.tsv**: Create `results.tsv` with just the header row. The baseline will be recorded after the first run.
-6. **Confirm and go**: Confirm setup looks good.
+In-scope files:
 
-Once you get confirmation, kick off experimentation.
+- `prepare.py` — fixed constants, dataset loading, and fixed evaluation. Do not modify.
+- `train.py` — SSL pre-training script (Stage-1 complete). Do not modify.
+- `st2.py` — Stage-2 supervised SFT script. **The file you modify.**
+
+Data exists at `VISLOC_ROOT` (default from `prepare.py`). No setup needed.
 
 ## Experimentation
 
-Each experiment runs on a single GPU. Each SSL experiment has a **budget of 2 hours on average, 3 hours at max** (wall clock).
+Each experiment runs on a single GPU. Each Stage-2 experiment has a **budget of ~45 minutes** (wall clock).
 
 Run command:
 
 ```bash
-uv run train.py > run.log 2>&1
+uv run st2.py --wandb-run-name st2-expN > run.log 2>&1
 ```
 
 Task details:
 
 - Model: `facebook/dinov3-vitb16-pretrain-lvd1689m`
 - Framework: PyTorch Lightning
-- Logging: Weights & Biases (`autoresearch-ssl-dinov3`, auth via env/WANDB_API_KEY)
-- Training approach: **Self-supervised learning on satellite imagery only** (no UAV images during training)
-- Training data: **SSL4EO-S12 S2RGB** patches at `/workspace/data/SSL4EOS12` — 244K global locations × 4 seasonal timestamps, 264×264 px RGB uint8. Loaded via `build_ssl4eo_ssl_pipeline` in `train.py` (uses `train_metadata.parquet` for geographic shard pre-filtering). SSL pairs are drawn from two different seasonal timestamps of the same location: anchor = strong crop+jitter (UAV-like), positive = mild crop (satellite-like).
-- Optional geographic filter: `--ssl4eo-lat-min 15 --ssl4eo-lat-max 55 --ssl4eo-lon-min 90 --ssl4eo-lon-max 135` restricts to the China / East Asia region matching VisLoc flights (~21K samples).
-- Validation flight: `03` (768 UAV queries, 2860 satellite chunks at default eval stride)
+- Logging: Weights & Biases (`autoresearch-ssl-dinov3-ssl4eos12-st2`, auth via env/WANDB_API_KEY)
+- SSL checkpoint: `checkpoints/dinov3-ssl4eos12-best-r@1=0.615-mvicreg-569ef72.ckpt` (Stage-1 best, fixed)
+- Train flights: `01, 02, 04, 05, 06, 08, 09, 10, 11`
+- Validation flight: `03` (768 UAV queries, 2860 satellite chunks)
 - Primary metric: `R@1` on flight 03, evaluated with fixed `evaluate_r1` in `prepare.py`
-- Zero-shot baseline (pretrained DINOv3, no training): **R@1 = 0.3398**
-- Previous supervised best (for reference only): R@1 = 0.7357
+- Goal: **R@1 >= 0.90**
 
-Satellite scale priors (usable with SatChunkDataset if adding VisLoc chunks to training):
+Satellite scale priors (from `prepare.py` — do not redefine):
 
 ```python
-sat_scales = {"01": 0.25, "02": 0.25, "03": 0.25, "04": 0.25, "05": 0.4, "06": 0.6, "08": 0.35, "09": 0.25, "10": 0.5, "11": 0.25}
+SAT_SCALES = {"01": 0.25, "02": 0.25, "03": 0.25, "04": 0.25, "05": 0.40, "06": 0.60, "08": 0.35, "09": 0.25, "10": 0.50, "11": 0.25}
 ```
+
+### Baselines
+
+| System | R@1 | R@5 | R@10 |
+|--------|-----|-----|------|
+| Zero-shot DINOv3 (no training) | 0.3398 | 0.5872 | 0.6732 |
+| SSL-only Stage-1 (this branch — SSL4EO-S12, no UAV labels) | 0.6150 | — | — |
+| Supervised only — Exp16 (from pretrained DINOv3) | 0.7357 | 0.8685 | 0.9167 |
+| Reference two-stage best (ref branch, SSL R@1=0.530 → st2 best) | 0.7786 | 0.8945 | 0.9414 |
+
+Our SSL checkpoint (R@1=0.615) is **+0.085 pp stronger** than the reference branch's SSL checkpoint (R@1=0.530). The two-stage st2-exp1 baseline should start at or above 0.7786.
 
 ### Evaluation protocol
 
-- Model is trained using self-supervised approaches on satellite chunks only.
-- Backbone adaptation uses **LoRA adapters** (no added projection head). This enables fast screening of which SSL approach works best. Further experiments may try unfreezing last N backbone blocks.
-- At evaluation, extract embeddings using `last_hidden_state[:, 0]` (CLS token) from the LoRA-adapted backbone, **768-d, no projection head**.
-- Evaluation uses the fixed `evaluate_r1` from `prepare.py` on flight 03: 768 UAV queries against 2860 satellite chunks.
-- Satellite TTA (averaging embeddings over 0/90/180/270° rotations) may be used at evaluation.
-
-### Experiment plan
-
-All experiments use SSL4EO-S12 S2RGB as the base training corpus unless stated otherwise. The canonical SSL pair is: two different seasonal timestamps of the same geographic location, anchor with strong scale crop (simulating UAV zoom), positive with mild crop and satellite-like quality degradation.
-
-Explore freely — there is no prescribed order. Design experiments based on what has worked so far, what hasn't, and the research context below. Promising directions include:
-
-- **InfoNCE with geographic filters**: global (244K samples) vs. China region lat 15–55 / lon 90–135 (~21K samples, closer to VisLoc flight regions). Use `--ssl4eo-lat-min 15 --ssl4eo-lat-max 55 --ssl4eo-lon-min 90 --ssl4eo-lon-max 135`.
-- **GeoRank regularization**: `georank_weight=0.1` — ties embedding similarity ranks to geographic distance ranks (Burgert et al., WACV 2025).
-- **VICReg objective**: swap InfoNCE for VICReg (variance–invariance–covariance). Avoids false-negative issues when seasonal pairs look similar.
-- **VisLoc satellite chunks mixed in**: add satellite chunks from all VisLoc flights (stride=64) alongside SSL4EO-S12. Teaches the exact visual domain of the evaluation region. Not cheating — no UAV images or GPS labels.
-- **Augmentation tuning**: adjust anchor/positive quality gap, crop scales, blur intensity.
-- **Hyperparameter search**: batch size, LR, LoRA rank/coverage, temperature.
-- **DINO self-distillation** (if R@1 < 0.50 after several experiments): teacher-student setup, EMA momentum 0.996→1.0, student sees local crops, teacher sees global crops. **Budget: 4 hours**.
-
-### Training notes
-
-- **SSL4EO-S12 data loading**: `build_ssl4eo_ssl_pipeline` in `train.py` reads `train_metadata.parquet` to pre-filter shards by lat/lon, then does a per-sample secondary filter inside each shard (shards have global mixing). Batching is done inside the pipeline (webdataset `.batched()`), so the DataLoader uses `batch_size=None`.
-- **Seasonal pairs**: Each SSL4EO-S12 sample has 4 seasonal timestamps (Spring/Summer/Autumn/Winter). Two timestamps are sampled without replacement per forward pass; t1 → anchor (strong aug), t2 → positive (mild aug). This teaches temporal/seasonal invariance on top of scale invariance.
-- **Training data stride for VisLoc chunks** (if added): Use stride_pixels=64 for training satellite chunks (4× denser than default). Eval stride stays at the default from prepare.py.
-- **Augmentation guidance**: UAV images are **higher quality and higher resolution** than satellite imagery — treat them as the clean reference. Anchor (UAV-like) = strong geometric crop (25–50% scale, simulating zoomed-in UAV perspective) with minimal quality degradation: only slight brightness/contrast jitter, no blur, no grayscale. Positive (satellite-like) = mild crop (75–100% scale) with quality degradation: GaussianBlur to simulate lower satellite resolution, moderate brightness/contrast jitter for weather/temporal variation. Avoid hue/saturation jitter on both — it alters spectral relationships.
-- **Logging**: Track total samples seen by the model, log LR, elapsed time × samples, and elapsed time × optimizer step metrics. Attach `run.log` to wandb as an artifact.
-- **Initial max_epochs**: 13 (inherited from previous best run). Agent can adjust freely if experiments justify it.
-
-### Research context
-
-These findings from the literature should guide experiment design:
-
-- **Smarter pair construction >> more data or architecture changes.** The biggest wins come from what counts as positive, what's a true hard negative, and how to weight ambiguous pairs (GeoRank, Sample4Geo, Semivariogram reweighting papers).
-- **GeoRank** (Burgert et al., WACV 2025): Rank-based geographic regularization validated with DINO. Adds an MSE loss between embedding similarity ranks and geographic distance ranks. Framework-agnostic, consistent gains.
-- **False negative danger**: Geographically close chunks that look similar are likely false negatives, not hard negatives. Naive hard negative mining based on visual similarity alone will incorrectly push apart representations of genuinely related locations (Semivariogram paper, 2025).
-- **Dataset size**: SSL performance saturates at 100-200k images (GeoRank). DINO-MC matched SeCo (1M images) with only 100k. The ~100k chunks from denser stride should be sufficient.
-- **GSD encoding** (Scale-MAE, WaveMAE): Encoding ground sample distance into positional embeddings improves performance when mixing scales. At a single fixed scale, less relevant.
+- Load SSL checkpoint, merge LoRA into weights, unfreeze all backbone params.
+- Backbone CLS token → 2-layer MLP projection head → 512-d L2-normalised embedding.
+- Satellite TTA: average embeddings over 4 rotations (0°/90°/180°/270°), re-normalise.
+- Evaluate with fixed `evaluate_r1` from `prepare.py`.
 
 **What you CAN do:**
 
-- Modify `train.py` only. Everything in `train.py` is fair game (loss functions, datasets, samplers, augmentations, optimizer/scheduler, LoRA config, precision, scale tuning, etc.).
-- Add LoRA adapters, modify the training loop, create new SSL dataset classes.
-- Perform significant exploration in step 6 based on findings from steps 1-5.
+- Modify `st2.py` only. Loss, sampler, augmentations, optimizer, scheduler, head architecture, gradient clipping, warmup, LR values, max_epochs — all fair game.
 
 **What you CANNOT do:**
 
-- Modify `prepare.py`.
-- Modify the fixed evaluation logic in `prepare.py`.
-- Install new packages or add dependencies during the loop.
-- Use UAV images during SSL training (satellite chunks only).
-
-**The goal is simple: maximize val `R@1` on flight 03 using self-supervised learning on satellite imagery.**
+- Modify `prepare.py` or `train.py`.
+- Change the SSL checkpoint path (always load `dinov3-ssl4eos12-best-r@1=0.615-mvicreg-569ef72.ckpt`).
+- Install new packages.
 
 **Simplicity criterion**: all else equal, simpler is better. Keep complexity proportional to gains.
 
@@ -110,7 +76,7 @@ These findings from the literature should guide experiment design:
 At run completion, extract key metrics from log:
 
 ```bash
-grep "R@1\|R@5\|R@10\|Best checkpoint\|Best val/R@1" run.log
+grep "VAL flight 03\|Best checkpoint\|Best val/R@1" run.log | tail -20
 ```
 
 If grep is empty, run crashed. Read stack trace:
@@ -140,51 +106,113 @@ Example:
 
 ```tsv
 commit	R@1	R@5	R@10	status	description
-a1b2c3d	0.312500	0.654948	0.781250	keep	baseline supervised contrastive max_epochs=10
-b2c3d4e	0.338542	0.671875	0.796875	keep	harder sat augmentation + lower temperature
-c3d4e5f	0.329427	0.667969	0.792969	discard	too strong color jitter
-d4e5f6g	0.000000	0.000000	0.000000	crash	OOM at batch_size=64
+a1b2c3d	0.312500	0.654948	0.781250	keep	baseline SSL→supervised reference Exp9 config
+b2c3d4e	0.338542	0.671875	0.796875	keep	UAV RandomRotation aug + UAV TTA at inference
 ```
 
 Do not commit `results.tsv`.
 
-## Prior experiments findings & project knowledge
+## Known lessons from reference two-stage branch (13 experiments)
 
-### Zero-shot baseline
+The reference branch ran the full Stage-2 experiment cycle starting from a weaker SSL checkpoint (R@1=0.530). Key validated findings (do not repeat these experiments):
 
-Pretrained DINOv3 (no training, CLS token embeddings): R@1=0.3398, R@5=0.5872, R@10=0.6732. This is the baseline all SSL experiments must beat.
+### What the st2.py baseline already encodes (Exp9 config)
+
+- **GPS exclusion zone (60m pos / 60–150m ignored)**: single largest gain (+0.78 pp). Tiles in the 60–150m ring around a UAV query are ambiguous (share ground features but are wrong answers). Excluding them from the InfoNCE denominator sharpens the loss from ~1.1 → ~0.825 nats. The 60m/150m threshold is validated; 40m/100m was consistently worse.
+- **k_flights=3 batch sampler**: harder geographic in-batch negatives. Chunks from 3 different flights per batch give better discriminative signal than k=2.
+- **4-tier LLRD** (5e-6 / 1e-5 / 1.5e-5 / 2e-5, head at 2e-5): smoother LR gradient through SSL-adapted blocks 8–11.
+- **CosineWarmRestarts T_0=10**: cycle-1 peaks at ~epoch 5, cycle-2 restart at epoch 10 is typically destructive (model finds a sharp basin; restart overshoots it). EarlyStopping patience=6 catches the peak.
+- **gradient_clip_val=1.0**: stabilises training without dampening convergence.
+- **2-layer MLP head** (no LayerNorm): converges in 5 epochs. 3-layer+LN head was too slow for the 20-epoch budget.
+
+### What did NOT help (do not retry)
+
+| Idea | Why not |
+|------|---------|
+| Warmup + plain cosine, no restarts | Stalled epoch 4; restarts needed to escape early plateau |
+| Stronger UAV aug during SFT (SSL-strength) | Too aggressive; peaked epoch 2 |
+| batch=96, k=3 (32/flight) | Bigger batch reduced per-flight hard negative density |
+| 3-layer projection head + LayerNorm | Too slow to converge in 20 epochs |
+| patience=10 through restart dip | Cycle-2 peaked 0.7604 — the restart itself is the problem |
+| ReduceLROnPlateau | Over-decayed LR by epoch 8, collapsed to 0.69 |
+| Tighter GPS 40m/100m threshold | 40–60m positives are informative; removing them weakens signal |
+| UAV TTA + satellite queue | Queue adds noisy early-epoch denominator terms; UAV TTA inconsistent without rotation aug |
+
+### Training dynamics (reference Exp9)
+
+```
+Epoch  1: R@1 ≈ 0.700   (rapid convergence from SSL init)
+Epoch  5: R@1 ≈ 0.779   ← cycle-1 peak (T_0 boundary)
+Epoch  6: R@1 ≈ 0.737   (LR bottoms at cycle end)
+Epoch 10: R@1 ≈ 0.742   (restart — LR spike, overshoots basin)
+Epoch 11: R@1 ≈ 0.716   (EarlyStopping fires; cycle-2 never recovers)
+```
+
+## Experiment plan
+
+All experiments build on the validated Exp9 config already encoded in `st2.py`. Execute in order.
+
+**st2-exp1 — Baseline: Exp9 config from reference branch, our SSL checkpoint**
+
+Run the exact reference Exp9 configuration with the stronger SSL4EO-S12 checkpoint (R@1=0.615 vs reference R@1=0.530). This establishes our two-stage baseline. Expected to meet or exceed 0.7786 due to better SSL initialisation.
+
+**st2-exp2 — RandomRotation on UAV training aug + UAV TTA at inference**
+
+Reference Exp13 found UAV TTA hurt (-0.028 pp) because UAV was trained with horizontal flip only — rotated views produced inconsistent embeddings that degraded the TTA average. The fix is to add `RandomRotation(degrees=180)` to the UAV training augmentation to make the backbone rotation-invariant across both modalities, then enable 4-rotation TTA at inference for UAV queries. This directly targets the drone-heading orientation gap (drones fly arbitrary headings; satellite is always north-up). Run on top of Exp1 config if Exp1 confirms the baseline holds; otherwise run on Exp1 best commit.
+
+**st2-exp3 — T_0=6 cosine schedule to exploit cycle-1 peak**
+
+Reference dynamics show cycle-1 peaks at ~epoch 5, and every restart at epoch 10 is destructive. Shorten T_0 to 6 epochs so the cycle trough (and thus one restart) occurs at epoch 6, then set EarlyStopping patience=3 to catch the peak before the restart fires — or simply stop after cycle-1 (max_epochs=6). This removes the destructive restart entirely while keeping the CosineWarmRestarts shape that proved necessary to escape early plateaus. Baseline: best config from Exp1/2.
+
+**st2-exp4 — Momentum-encoder satellite queue (MoCo-style hard negatives)**
+
+Reference Exp13 used a satellite embedding queue from the *main encoder*, which caused noisy early-epoch denominator terms. The correct approach is a *momentum encoder* (EMA of main encoder, β=0.995) with a queue of recent satellite embeddings — standard MoCo-v2. The momentum encoder's embeddings are stable across training steps, removing the noise. Queue size=1024 (16× larger than reference queue=128), GPS-far filter (>150m from each UAV anchor). Only queue satellite (K) embeddings; UAV (Q) stays from main encoder. Run on top of best Exp1/2 config.
+
+**st2-exp5 — Free experimentation**
+
+Based on Exp1–4 findings, explore promising directions. Options:
+- Listwise ranking loss (AP@1 or SmoothAP) — directly optimises the ranking metric instead of InfoNCE; targets the "correct tile is in top-10 but not rank-1" gap (R@10=0.94, R@1=~0.78)
+- Combine Exp2 (UAV rotation invariance) + Exp3 (short T_0) + Exp4 (momentum queue) if each independently improved
+- Longer training (25 epochs, single cosine cycle over full budget) if EarlyStopping consistently fires at epoch 5–6
+- Patch re-ranking: use spatial patch token similarity to re-rank top-10 CLS candidates at inference (zero extra training cost)
+
+### Training notes
+
+- **Epoch budget**: 20 epochs unless a specific experiment justifies more or less.
+- **Checkpoints**: saved to `checkpoints/<wandb-run-name>/` (e.g. `checkpoints/st2-exp1/`). Best by `val/R@1`.
+- **Early stopping**: patience=6 on `val/R@1` (unless experiment changes this).
+- **Precision**: `16-mixed` on A100.
+
+## Prior experiments findings
+
+### SSL4EO-S12 Stage-1 (train.py — this branch)
+
+- **Multi-positive VICReg on SSL4EO-S12**: Best SSL checkpoint achieves R@1=0.615 on flight 03 (vs zero-shot 0.340). Training on global satellite data from China/East Asia lat 15–55, lon 90–135. Multi-positive approach (n_ssl_positives=3, all 4 seasons) + LoRA r16 = final best.
+- **LoRA config** (matches the checkpoint): rank=16, alpha=32, last 4 blocks, all QKV projections.
+- **VICReg** outperformed InfoNCE for this SSL task: avoids false-negative collapse when seasonal pairs look similar.
+- **Cross-scale pairs** (anchor 25–50%, positive 75–100%) simulate UAV vs satellite scale gap.
+- **Asymmetric augmentation**: strong anchor aug (ColorJitter+GaussianBlur+RandomGrayscale) simulates UAV sensor gap; mild positive aug preserves satellite appearance.
 
 ### Previous supervised experiments (branch: autoresearch/supervised-dinov3)
 
-A prior supervised training run fine-tuned DINOv3 on UAV-satellite pairs with multi-positive InfoNCE and reached R@1=0.7357. Key findings from 16 supervised experiments:
-- **Resolution matters**: 336px input gave +7% R@1 over 224px (preserve satellite texture)
-- **Hard negative mining is crucial**: Two-flight batch sampler gave +5% R@1 (force spatial precision)
-- **Augmentation helps**: Geometric augmentations + domain-gap targeting gave +3.5% R@1
-- **Full backbone fine-tuning with LLRD beats partial freezing**: 3-tier LR (5e-6 / 1e-5 / 2e-5 / 5e-5 for head)
-- **What failed**: GeM pooling, asymmetric heads, register token concatenation, RandomResizedCrop on UAV, larger batch sizes (96 > 64 was worse)
-- **R@10=0.9167**: The model finds the right area but struggles to rank the exact chunk #1
-- **R@10 shaping the latent space**: pay attention to the R@10 metric as well
-
-### Dataset description
-
-**VisLoc**: UAV images are high-quality nadir photos from a Mavic-like drone. Satellite imagery is a large GeoTIFF map split into overlapping chunks. The goal is UAV-to-satellite geo-localization through image retrieval. The domain gap comes from camera quality differences (UAV images have better quality, different colors, slight haze, lower contrast) and potential timing differences (satellite images may be outdated). All VisLoc flights are in China (lat 24–41°, lon 100–121°). Training regions include some bodies of water.
-
-**SSL4EO-S12 v1.1** (`/workspace/data/SSL4EOS12`): Global satellite dataset with 246K locations × 4 seasonal Sentinel-2 timestamps. The S2RGB modality (used here) is 264×264 px RGB uint8. Data is organized as WebDataset TAR shards (`train/S2RGB/ssl4eos12_shard_*.tar`, 477 shards × 512 samples). A `train_metadata.parquet` at the root provides per-sample center_lat, center_lon, tar filename, and cloud_cover per season — used for efficient geographic pre-filtering. Source: https://huggingface.co/datasets/embed2scale/SSL4EO-S12-v1.1
+- **Resolution matters**: 336px gave +7% R@1 over 224px.
+- **Hard negatives**: TwoFlightBatchSampler +5% R@1.
+- **Full backbone LLRD beats partial freezing**.
+- **What failed**: GeM pooling, asymmetric heads, register tokens, RandomResizedCrop on UAV, batch>64.
+- **R@10=0.9167**: model finds the right area but ranking precision is the bottleneck.
 
 ### Environment
 
-The experiments loop is conducted on a powerful machine that has an A100 GPU with 80GB of VRAM - keep that in mind and utilize the GPU accordingly.
+- A100 GPU, 80 GB VRAM. Each Stage-2 run takes ~30–45 minutes.
 
 ## The experiment loop
-
-The experiment runs on a dedicated branch (agreed during setup).
 
 LOOP:
 
 1. Look at git state: current branch/commit.
-2. Design and implement the next experiment by modifying `train.py`. Draw on prior findings, the research context, and promising directions listed above.
-3. git commit with a descriptive message.
-4. Run experiment: `uv run train.py > run.log 2>&1` (redirect everything — do NOT use tee or let output flood your context)
+2. Implement the next experiment from the plan by modifying `st2.py`.
+3. `git commit` with a descriptive message.
+4. Run: `uv run st2.py --wandb-run-name st2-expN > run.log 2>&1`
 5. Read out results from `run.log`.
 6. If metrics are missing, run crashed. Use `tail -n 50 run.log` and attempt fix; if not quickly fixable, log crash and move on.
 7. Record results in `results.tsv` with a textual description of the attempt.
@@ -192,10 +220,8 @@ LOOP:
 9. If `R@1` is equal/worse, reset to previous best commit.
 10. Move to the next experiment in the plan.
 
-**Timeout**: Each experiment should take ~2 hours on average, 3 hours max. If a run exceeds 3.5 hours, kill it, leave a timeout note in the results, and use the best validation metric logged so far. Exception: experiment 8 (DINO self-distillation) has a 4-hour budget.
+**Timeout**: If a run exceeds 55 minutes, kill it and use the best val metric logged so far.
 
 **Crashes**: If a run crashes (OOM, or a bug, or etc.), use your judgment: If it's something dumb and easy to fix (e.g. a typo, a missing import), fix it and re-run. If the idea itself is fundamentally broken, just skip it, log "crash" as the status in the tsv, and move on.
 
-**NEVER STOP**: Once the experiment loop has begun (after the initial setup), do NOT pause to ask the human if you should continue. Do NOT ask "should I keep going?" or "is this a good stopping point?". The human might be asleep, or gone from a computer and expects you to continue working _indefinitely_ until you are manually stopped. You are autonomous. If you run out of ideas in step 6 (free experimentation), think harder — read related papers on the topic (use arxiv and other sources), re-read the in-scope files for new angles, try combining previous near-misses, try more radical approaches. The loop runs until the human interrupts you, period.
-
-As an example use case, a user might leave you running while they sleep. Each SSL experiment takes ~2 hours, so you can run about 4-5 experiments overnight. The user then wakes up to experimental results, all completed by you while they slept!
+**NEVER STOP**: Once the experiment loop has begun, do NOT pause to ask the human if you should continue. You are autonomous. The loop runs until the human interrupts you, period.
