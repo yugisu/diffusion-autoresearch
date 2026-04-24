@@ -5,14 +5,13 @@ Backbone: loaded from SSL checkpoint (LoRA merged into weights), then fully
           unfrozen with 4-tier LLRD.
 Training: multi-positive InfoNCE + GPS exclusion zone (60m pos / 60-150m ignored)
           + TwoFlightBatchSampler k_flights=3 + CosineAnnealingWarmRestarts T_0=20
-          + grad_clip=1.0 + head lr=2e-5.
+          + grad_clip=1.0 + head lr=3e-5.
 
-Exp6 changes on top of Exp2 baseline:
-  - T_0=20 (single cosine descent over full 20-epoch budget, no restart)
-    Avoids the destructive LR spike at epoch 10 that reference experiments showed
-    overshoots the converged basin. T_0=20 with max_epochs=25 means one smooth
-    descent from η_max to η_min; the restart fires at epoch 20 outside the training.
-  - max_epochs=25 to allow model to find its basin past the T_0=10 peak region.
+Exp7 changes on top of Exp6 baseline:
+  - Head LR 2e-5 → 3e-5: projection head is the embedding bottleneck; giving it
+    50% more LR headroom may allow sharper cross-modal separation within the same
+    cosine-decay budget. Backbone LLRD unchanged (5e-6/1e-5/1.5e-5/2e-5).
+  - Keeps exp6: T_0=20 single cosine cycle + max_epochs=25.
   - Keeps exp2: RandomRotation(180) UAV aug + UAV 4-rotation TTA at inference.
 
 Baseline config encodes all findings from the reference two-stage branch (Exp9):
@@ -516,7 +515,7 @@ class DinoCrossViewRetrieverST2(pl.LightningModule):
             {"params": mid_backbone_params, "lr": 1e-5},
             {"params": mid_late_backbone_params, "lr": 1.5e-5},
             {"params": top_backbone_params, "lr": 2e-5},
-            {"params": head_params, "lr": 2e-5},
+            {"params": head_params, "lr": 3e-5},
         ]
         optimizer = AdamW(param_groups, weight_decay=self.cfg.weight_decay)
 
