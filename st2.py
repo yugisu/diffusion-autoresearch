@@ -7,13 +7,18 @@ Training: multi-positive InfoNCE + GPS exclusion zone (60m pos / 60-150m ignored
           + TwoFlightBatchSampler k_flights=3 + CosineAnnealingWarmRestarts T_0=10
           + grad_clip=1.0 + head lr=2e-5.
 
+Exp2 adds on top of Exp1 baseline:
+  - RandomRotation(degrees=180) added to UAV training aug → backbone learns
+    rotation-invariant UAV features (drones fly arbitrary headings)
+  - UAV TTA at inference: 4-rotation average (same as satellite TTA), enabled
+    because training now provides consistent rotated views
+
 Baseline config encodes all findings from the reference two-stage branch (Exp9):
   - GPS exclusion zone is the single largest gain (+0.78 pp R@1)
   - k_flights=3 geographic batch sampler: harder in-batch negatives
   - CosineWarmRestarts T_0=10: cycle-1 peaks ~epoch 5, restart at epoch 10
     is typically destructive — EarlyStopping patience=6 catches the peak
   - 4-tier LLRD (5e-6 / 1e-5 / 1.5e-5 / 2e-5), head at 2e-5
-  - NO UAV TTA at inference (hurts without matching RandomRotation in training aug)
   - NO satellite queue (noisy early-epoch denominator terms)
 
 SSL checkpoint: checkpoints/dinov3-ssl4eos12-best-r@1=0.615-mvicreg-569ef72.ckpt
@@ -278,6 +283,7 @@ class VisLocDataModule(pl.LightningDataModule):
         self.train_uav_transform = transforms.Compose([
             transforms.Resize((cfg.image_size, cfg.image_size)),
             transforms.RandomHorizontalFlip(p=0.5),
+            transforms.RandomRotation(degrees=180),
             transforms.RandomPerspective(distortion_scale=0.2, p=0.5),
             transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.3, hue=0.1),
             transforms.GaussianBlur(kernel_size=5, sigma=(0.1, 2.0)),
@@ -358,7 +364,8 @@ class DinoCrossViewRetrieverST2(pl.LightningModule):
     Loss:          multi-positive InfoNCE with GPS exclusion zone (60m pos / 60-150m ignored).
     Optimizer:     AdamW with 4-tier LLRD (5e-6 / 1e-5 / 1.5e-5 / 2e-5 / 2e-5 head).
     Scheduler:     CosineAnnealingWarmRestarts, T_0=10 epochs, step-level.
-    Validation:    satellite TTA (4 rotations avg), no UAV TTA (no rotation aug in training).
+    Validation:    UAV TTA (4 rotations avg) + satellite TTA (4 rotations avg).
+                   UAV TTA enabled because RandomRotation(180) is in training aug.
     """
 
     def __init__(self, cfg: Config):
@@ -460,8 +467,12 @@ class DinoCrossViewRetrieverST2(pl.LightningModule):
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
         imgs, lat, lon = batch
         if dataloader_idx == 0:
-            # UAV: no TTA (no RandomRotation in training aug → rotated views are inconsistent)
-            emb = self.encode(imgs)
+            # UAV TTA: 4 rotations (RandomRotation in training aug makes this consistent)
+            e0 = self.encode(imgs)
+            e1 = self.encode(torch.rot90(imgs, 1, [2, 3]))
+            e2 = self.encode(torch.rot90(imgs, 2, [2, 3]))
+            e3 = self.encode(torch.rot90(imgs, 3, [2, 3]))
+            emb = F.normalize((e0 + e1 + e2 + e3) / 4.0, dim=-1)
             self._val_uav_embs.append(emb.detach().cpu())
             self._val_uav_coords.append(torch.stack([lat, lon], dim=1).detach().cpu())
         else:
