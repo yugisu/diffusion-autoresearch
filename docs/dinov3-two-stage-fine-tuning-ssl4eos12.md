@@ -131,7 +131,7 @@ logits -= 1e9 * ignore_mask             # mask 60–150m ring
 loss = 0.5 * (InfoNCE(Q→K) + InfoNCE(K→Q))
 ```
 
-### SmoothAP (exp8–9)
+### SmoothAP (exp8–10)
 
 Directly optimises Average Precision via sigmoid-based soft rank:
 
@@ -145,6 +145,15 @@ loss = −0.5 * (mean(AP_Q→K) + mean(AP_K→Q))
 ```
 
 SmoothAP converges more slowly (peaks at epoch 12 vs epoch 7–8 for InfoNCE) but achieves a significantly higher ceiling and consistently better R@10.
+
+**Exp10 variant — Gaussian-weighted positives (σ=60m):**
+
+```
+pos_weight[i,j] = exp(-d[i,j]² / (2 * 60²))  for d < 60m, else 0
+AP(i) = Σ_p(w_p / smooth_rank_p) / Σ_p(w_p)   # weighted average
+```
+
+This variant down-weights positives in the 30–60m range (weight 0.6–1.0) vs binary mask (all weight 1.0). It did not improve over the binary mask — see exp10 findings.
 
 ### Patch Re-ranking at Inference (exp9, zero training cost)
 
@@ -179,6 +188,7 @@ DINOv3 patch tokens encode local spatial texture that CLS averages away. Chamfer
 | 7 | 4ac127e | 0.8112 | 0.9128 | 0.9583 | keep | Head LR 2e-5 → 3e-5: faster ramp, peaked epoch 8 (+0.003) |
 | **8** | **388d67f** | **0.8255** | **0.9284** | **0.9661** | **keep** | **SmoothAP τ=0.01: peaked epoch 12, R@10 record (+0.014 vs exp7)** |
 | **9** | **448c62e** | **0.8581** | **0.9466** | **0.9701** | **keep** | **Patch token re-ranking K=50 α=0.5: +0.033 at zero training cost** |
+| 10 | 45f8f76 | 0.8164 | 0.9258 | 0.9544 | discard | Gaussian-weighted SmoothAP positives σ=60m: peaked 0.8164 vs binary exp8 0.8255 (−0.009) |
 
 ---
 
@@ -213,13 +223,18 @@ Multi-positive VICReg's advantage over InfoNCE for SSL is that it avoids false-n
 
 Reference branch dynamics carried over: every LR restart was destructive. With the GPS exclusion zone sharpening the loss, the model finds a sharp basin by epoch 5–7 and a warm restart at epoch 10 consistently overshoots it. Using T₀=20 (one smooth cosine descent over the full budget) allowed the model to continue refining past epoch 10 without disruption. SmoothAP benefited most from this — it peaked at epoch 12, which would have been after two destructive restarts with T₀=10.
 
-### 5. What did not help
+### 5. Binary positive mask beats Gaussian-weighted positives (exp10)
+
+Replacing the hard 60m threshold with Gaussian distance weights (σ=60m: weights 1.0→0.6 across the 0–60m range) slightly hurt performance (0.8164 vs 0.8255, −0.009 pp). The reason: tiles in the 30–60m range are still correct retrieval targets, and the full-weight gradient from those pairs helps the loss distinguish the correct flight area from geographically nearby but wrong tiles. Down-weighting them reduces the discriminative signal without a compensating precision benefit — the loss has fewer effective positives to push against the negatives. The binary mask is simpler and works better.
+
+### 6. What did not help
 
 | Idea | Result | Why |
 |------|--------|-----|
 | T₀=6 short schedule (exp3) | 0.7891 | Too aggressive — peaked epoch 2, never built momentum |
 | MoCo momentum encoder + queue (exp4) | 0.7214 | 1024-entry denominator overwhelmed the positive signal; needed 3× more epochs to converge |
 | Supervised VICReg (exp5) | 0.4414 | VICReg without negatives cannot create cross-modal discriminative structure; variance term spreads embeddings globally but doesn't separate modalities |
+| Gaussian-weighted SmoothAP positives σ=60m (exp10) | 0.8164 | Down-weighting 30–60m positives reduced useful gradient from that range; binary mask is better |
 
 ---
 
@@ -247,6 +262,18 @@ Epoch 18: R@1 = 0.819   (EarlyStopping fires, patience=6)
 
 SmoothAP loss values (negative AP): epoch 0 ≈ −0.40, epoch 12 ≈ −0.65 (AP improved from 0.40 to 0.65 over training).
 
+### Gaussian-weighted SmoothAP (exp10, negative result)
+
+```
+Epoch  0: R@1 = 0.698   (similar start to exp8)
+Epoch  2: R@1 = 0.785
+Epoch  8: R@1 = 0.807
+Epoch 12: R@1 = 0.816   ← best (vs exp8: 0.826)
+Epoch 18: R@1 = 0.811   (EarlyStopping fires)
+```
+
+The Gaussian weighting consistently underperformed binary masks at every epoch by ~0.01 pp. The convergence shape is identical, confirming the effect is a steady reduction in gradient magnitude from the 30–60m range, not a convergence pathology.
+
 ---
 
 ## Gap Analysis
@@ -264,12 +291,10 @@ R@10=0.970 means the correct tile is retrieved in the top-10 **97% of the time**
 
 ### Promising directions to close the remaining gap
 
-1. **Distance-weighted SmoothAP positives** — replace binary pos_mask with Gaussian weights (σ=60m): tiles 5m away weight≈1.0, tiles 55m away weight≈0.6. Rewards placing the closest tile at rank 1 specifically, not just any tile within 60m. Expected gain: +0.01–0.02 pp R@1.
+1. **Tune patch re-ranking hyperparameters** — K=50 and α=0.5 were not tuned. Larger K (top-100) and higher patch weight (α=0.7) may help; smaller τ_rank for SmoothAP patch scoring is also an option.
 
-2. **Tune patch re-ranking hyperparameters** — K=50 and α=0.5 were not tuned. Larger K (top-100) and higher patch weight (α=0.7) may help; smaller τ_rank for SmoothAP patch scoring is also an option.
+2. **Cross-attention re-ranker** — replace the hand-crafted chamfer similarity with a learned cross-attention module over UAV and satellite patch tokens, fine-tuned on hard pairs from the training set. More expressive but requires additional training.
 
-3. **Cross-attention re-ranker** — replace the hand-crafted chamfer similarity with a learned cross-attention module over UAV and satellite patch tokens, fine-tuned on hard pairs from the training set. More expressive but requires additional training.
+3. **Multi-scale patch tokens** — aggregate patch tokens from multiple ViT layers (e.g., blocks 8, 10, 12) for re-ranking. Lower layers capture texture, higher layers capture semantics; a multi-scale chamfer may be more robust.
 
-4. **Multi-scale patch tokens** — aggregate patch tokens from multiple ViT layers (e.g., blocks 8, 10, 12) for re-ranking. Lower layers capture texture, higher layers capture semantics; a multi-scale chamfer may be more robust.
-
-5. **Harder negative mining during SmoothAP training** — sample negatives from within the same geographic region (k_flights=4, or add a small GPS-filtered embedding queue) to push the SmoothAP loss to penalise confusable nearby tiles more aggressively.
+4. **Harder negative mining during SmoothAP training** — sample negatives from within the same geographic region (k_flights=4, or add a small GPS-filtered embedding queue) to push the SmoothAP loss to penalise confusable nearby tiles more aggressively.
