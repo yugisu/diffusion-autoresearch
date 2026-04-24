@@ -3,24 +3,19 @@ Stage-2 supervised fine-tuning on top of the best SSL4EO-S12 SSL checkpoint.
 
 Backbone: loaded from SSL checkpoint (LoRA merged into weights), then fully
           unfrozen with 4-tier LLRD.
-Training: multi-positive InfoNCE + GPS exclusion zone (60m pos / 60-150m ignored)
+Training: SmoothAP loss + GPS exclusion zone (60m pos / 60-150m ignored)
           + TwoFlightBatchSampler k_flights=3 + CosineAnnealingWarmRestarts T_0=20
           + grad_clip=1.0 + head lr=3e-5.
 
-Exp7 changes on top of Exp6 baseline:
-  - Head LR 2e-5 → 3e-5: projection head is the embedding bottleneck; giving it
-    50% more LR headroom may allow sharper cross-modal separation within the same
-    cosine-decay budget. Backbone LLRD unchanged (5e-6/1e-5/1.5e-5/2e-5).
-  - Keeps exp6: T_0=20 single cosine cycle + max_epochs=25.
+Exp8 changes on top of Exp7 baseline:
+  - Replace multi-positive InfoNCE with SmoothAP loss (tau_rank=0.01).
+    SmoothAP is a differentiable approximation to Average Precision that
+    directly maximises AP rather than a softmax proxy. The smooth rank of a
+    positive p for query i is 1 + Σ_j σ((sim_ij − sim_ip) / τ); AP = 1/rank.
+    GPS ignore zone (60-150m) is masked out before rank estimation.
+    Symmetric loss: average of Q→K and K→Q directions.
+  - Keeps exp7: head LR=3e-5, T_0=20 single cosine cycle, max_epochs=25.
   - Keeps exp2: RandomRotation(180) UAV aug + UAV 4-rotation TTA at inference.
-
-Baseline config encodes all findings from the reference two-stage branch (Exp9):
-  - GPS exclusion zone is the single largest gain (+0.78 pp R@1)
-  - k_flights=3 geographic batch sampler: harder in-batch negatives
-  - CosineWarmRestarts T_0=10: cycle-1 peaks ~epoch 5, restart at epoch 10
-    is typically destructive — EarlyStopping patience=6 catches the peak
-  - 4-tier LLRD (5e-6 / 1e-5 / 1.5e-5 / 2e-5), head at 2e-5
-  - NO satellite queue (noisy early-epoch denominator terms)
 
 SSL checkpoint: checkpoints/dinov3-ssl4eos12-best-r@1=0.615-mvicreg-569ef72.ckpt
 Reference branch best: R@1=0.7786 (starting from SSL R@1=0.530)
@@ -430,34 +425,51 @@ class DinoCrossViewRetrieverST2(pl.LightningModule):
         )
         return pos_mask, ignore_mask
 
-    def _multi_pos_infonce(
+    def _smooth_ap_loss(
         self,
         q: torch.Tensor,
         k: torch.Tensor,
         pos_mask: torch.Tensor,
         ignore_mask: torch.Tensor,
+        tau_rank: float = 0.01,
     ) -> torch.Tensor:
-        scale = self.logit_scale.exp().clamp(max=100)
-        logits = (q @ k.t()) * scale
-        logits = logits - 1e9 * ignore_mask
-        # Q→K
-        log_probs = F.log_softmax(logits, dim=1)
-        n_pos = pos_mask.sum(dim=1).clamp(min=1)
-        loss_qk = -(log_probs * pos_mask).sum(dim=1) / n_pos
-        # K→Q (symmetric)
-        log_probs_t = F.log_softmax(logits.t(), dim=1)
-        n_pos_t = pos_mask.t().sum(dim=1).clamp(min=1)
-        loss_kq = -(log_probs_t * pos_mask.t()).sum(dim=1) / n_pos_t
-        return 0.5 * (loss_qk.mean() + loss_kq.mean())
+        """SmoothAP: differentiable AP via sigmoid-based soft rank estimation.
+
+        smooth_rank(query_i, pos_p) = 1 + Σ_j sigmoid((sim_ij - sim_ip) / τ)
+        AP(query_i) = mean over positives of 1/smooth_rank
+        Loss = -mean AP (symmetric Q→K and K→Q).
+        GPS ignore zone is zeroed before rank estimation.
+        """
+        # Cast to float32: sigmoid in half-precision loses gradient for large diffs
+        sims = (q.float() @ k.float().t())  # [N, N], cosine in [-1, 1]
+        sims = sims - 1e4 * ignore_mask.float()  # crush ignored tiles out of ranking
+
+        # diff[i, p, j] = sim(query_i, gallery_j) - sim(query_i, gallery_p)
+        # Positive p ranks lower (higher index) the more j's outscore it.
+        diff = sims.unsqueeze(1) - sims.unsqueeze(2)  # [N, N, N]
+        smooth_rank = 1.0 + torch.sigmoid(diff / tau_rank).sum(dim=2)  # [N, N]
+
+        pm = pos_mask.float()
+        n_pos = pm.sum(dim=1).clamp(min=1)
+        ap_qk = (pm / smooth_rank).sum(dim=1) / n_pos  # [N]
+
+        # Symmetric K→Q direction
+        sims_t = sims.t()
+        diff_t = sims_t.unsqueeze(1) - sims_t.unsqueeze(2)
+        smooth_rank_t = 1.0 + torch.sigmoid(diff_t / tau_rank).sum(dim=2)
+        pm_t = pm.t()
+        n_pos_t = pm_t.sum(dim=1).clamp(min=1)
+        ap_kq = (pm_t / smooth_rank_t).sum(dim=1) / n_pos_t  # [N]
+
+        return -0.5 * (ap_qk.mean() + ap_kq.mean())
 
     def training_step(self, batch, batch_idx):
         uav, sat, uav_coords, sat_coords = batch
         q = self.encode(uav)
         k = self.encode(sat)
         pos_mask, ignore_mask = self._build_masks(uav_coords, sat_coords)
-        loss = self._multi_pos_infonce(q, k, pos_mask, ignore_mask)
+        loss = self._smooth_ap_loss(q, k, pos_mask, ignore_mask)
         self.log("train/loss", loss, on_step=True, on_epoch=True, prog_bar=True, batch_size=uav.size(0))
-        self.log("train/logit_scale", self.logit_scale.exp(), on_step=True, on_epoch=False)
         return loss
 
     def on_validation_epoch_start(self):
