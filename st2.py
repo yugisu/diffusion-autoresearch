@@ -61,6 +61,7 @@ from prepare import (
     UAVDataset,
     build_ground_truth,
     evaluate_r1,
+    recall_at_k,
 )
 from train import LoRALinear, apply_lora
 
@@ -149,6 +150,9 @@ class Config:
     visloc_root: str = str(VISLOC_ROOT)
     model_name: str = DINO_MODEL
     ssl_ckpt: str = SSL_CKPT_DEFAULT
+    sft_ckpt: str = ""        # SFT checkpoint to load in eval-only mode
+    eval_only: bool = False   # skip training, run validation only
+
     image_size: int = 336
     embedding_dim: int = 512
 
@@ -393,6 +397,14 @@ class DinoCrossViewRetrieverST2(pl.LightningModule):
         emb = self.proj(cls)
         return F.normalize(emb, dim=-1)
 
+    def encode_with_patches(self, x: torch.Tensor):
+        """Returns (cls_emb [B,D], patch_tokens [B,P,D]) both L2-normalised."""
+        out = self.backbone(pixel_values=x)
+        hidden = out.last_hidden_state  # [B, 1+P, D]
+        cls_emb = F.normalize(self.proj(hidden[:, 0]), dim=-1)
+        patches = F.normalize(hidden[:, 1:], dim=-1).half()  # float16 to cap memory
+        return cls_emb, patches
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.encode(x)
 
@@ -476,26 +488,30 @@ class DinoCrossViewRetrieverST2(pl.LightningModule):
         self._val_uav_embs = []
         self._val_sat_embs = []
         self._val_uav_coords = []
+        self._val_uav_patches = []
+        self._val_sat_patches = []
 
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
         imgs, lat, lon = batch
         if dataloader_idx == 0:
-            # UAV TTA: 4 rotations (RandomRotation in training aug makes this consistent)
-            e0 = self.encode(imgs)
+            # UAV TTA: 4 rotations; also grab 0° patch tokens for re-ranking
+            e0, patches = self.encode_with_patches(imgs)
             e1 = self.encode(torch.rot90(imgs, 1, [2, 3]))
             e2 = self.encode(torch.rot90(imgs, 2, [2, 3]))
             e3 = self.encode(torch.rot90(imgs, 3, [2, 3]))
             emb = F.normalize((e0 + e1 + e2 + e3) / 4.0, dim=-1)
             self._val_uav_embs.append(emb.detach().cpu())
+            self._val_uav_patches.append(patches.detach().cpu())
             self._val_uav_coords.append(torch.stack([lat, lon], dim=1).detach().cpu())
         else:
-            # Satellite TTA: 4 rotations (satellite is north-up, rotation invariance is free)
-            e0 = self.encode(imgs)
+            # Satellite TTA: 4 rotations; also grab 0° patch tokens for re-ranking
+            e0, patches = self.encode_with_patches(imgs)
             e1 = self.encode(torch.rot90(imgs, 1, [2, 3]))
             e2 = self.encode(torch.rot90(imgs, 2, [2, 3]))
             e3 = self.encode(torch.rot90(imgs, 3, [2, 3]))
             emb = F.normalize((e0 + e1 + e2 + e3) / 4.0, dim=-1)
             self._val_sat_embs.append(emb.detach().cpu())
+            self._val_sat_patches.append(patches.detach().cpu())
 
     def on_validation_epoch_end(self):
         if not self._val_uav_embs or not self._val_sat_embs:
@@ -503,6 +519,8 @@ class DinoCrossViewRetrieverST2(pl.LightningModule):
         uav_embs = torch.cat(self._val_uav_embs).numpy().astype(np.float32)
         sat_embs = torch.cat(self._val_sat_embs).numpy().astype(np.float32)
         uav_coords = torch.cat(self._val_uav_coords).numpy().astype(np.float32)
+
+        # Standard CLS-based evaluation
         metrics = evaluate_r1(uav_embs, sat_embs, uav_coords, self.trainer.datamodule.val_sat_ds.chunk_bboxes)
         self.log("val/R@1", float(metrics["R@1"]), prog_bar=True, sync_dist=False)
         self.log("val/R@5", float(metrics["R@5"]), sync_dist=False)
@@ -511,6 +529,40 @@ class DinoCrossViewRetrieverST2(pl.LightningModule):
         print(
             f"[VAL flight {VAL_FLIGHT}] R@1={metrics['R@1']:.4f} R@5={metrics['R@5']:.4f}"
             f" R@10={metrics['R@10']:.4f} | gap_to_90={gap:.4f}"
+        )
+
+        # Patch re-ranking: re-rank top-50 CLS candidates using chamfer patch similarity
+        # Uses 0° rotation patch tokens from encode_with_patches (stored as float16)
+        device = next(self.parameters()).device
+        uav_patches = torch.cat(self._val_uav_patches).float().to(device)  # [N_u, P, D]
+        sat_patches = torch.cat(self._val_sat_patches).float().to(device)  # [N_s, P, D]
+        uav_t = torch.from_numpy(uav_embs).to(device)
+        sat_t = torch.from_numpy(sat_embs).to(device)
+        uav_t = F.normalize(uav_t, dim=-1)
+        sat_t = F.normalize(sat_t, dim=-1)
+        sims = (uav_t @ sat_t.t()).cpu().numpy()  # [N_u, N_s]
+
+        K, alpha = 50, 0.5
+        for i in range(len(uav_embs)):
+            top_k_idx = np.argsort(-sims[i])[:K]
+            uav_p = uav_patches[i]  # [P, D]
+            sat_k = sat_patches[top_k_idx]  # [K, P, D]
+            # Chamfer: mean over UAV patches of max satellite-patch similarity
+            sim_mat = uav_p.unsqueeze(0) @ sat_k.transpose(-1, -2)  # [K, P, P]
+            patch_sims = sim_mat.max(dim=2).values.mean(dim=1).cpu().numpy()  # [K]
+            sims[i, top_k_idx] = alpha * sims[i, top_k_idx] + (1 - alpha) * patch_sims
+
+        chunk_bboxes = self.trainer.datamodule.val_sat_ds.chunk_bboxes
+        preds_r = np.argsort(-sims, axis=1)
+        gt = build_ground_truth(uav_coords, chunk_bboxes)
+        r1r = recall_at_k(preds_r, gt, 1)
+        r5r = recall_at_k(preds_r, gt, 5)
+        r10r = recall_at_k(preds_r, gt, 10)
+        self.log("val/R@1_patch", float(r1r), sync_dist=False)
+        gap_r = 0.90 - r1r
+        print(
+            f"[VAL patch-reranked K={K} α={alpha}] R@1={r1r:.4f} R@5={r5r:.4f}"
+            f" R@10={r10r:.4f} | gap_to_90={gap_r:.4f}"
         )
 
     def configure_optimizers(self):
@@ -563,12 +615,16 @@ def parse_args() -> Config:
     parser.add_argument("--seed", type=int, default=Config.seed)
     parser.add_argument("--wandb-project", type=str, default=Config.wandb_project)
     parser.add_argument("--wandb-run-name", type=str, default=None)
+    parser.add_argument("--sft-ckpt", type=str, default="", help="SFT checkpoint for --eval-only mode")
+    parser.add_argument("--eval-only", action="store_true", help="Skip training; validate with --sft-ckpt")
     args = parser.parse_args()
 
     return Config(
         visloc_root=args.visloc_root,
         model_name=args.model_name,
         ssl_ckpt=args.ssl_ckpt,
+        sft_ckpt=args.sft_ckpt,
+        eval_only=args.eval_only,
         image_size=args.image_size,
         embedding_dim=args.embedding_dim,
         batch_size=args.batch_size,
@@ -641,10 +697,14 @@ def main():
         gradient_clip_val=1.0,
     )
 
-    trainer.fit(model, datamodule=datamodule)
-
-    print("Best checkpoint:", ckpt_cb.best_model_path)
-    print("Best val/R@1:", float(ckpt_cb.best_model_score) if ckpt_cb.best_model_score is not None else None)
+    if cfg.eval_only:
+        ckpt = cfg.sft_ckpt or None
+        print(f"[eval-only] loading SFT checkpoint: {ckpt}")
+        trainer.validate(model, datamodule=datamodule, ckpt_path=ckpt)
+    else:
+        trainer.fit(model, datamodule=datamodule)
+        print("Best checkpoint:", ckpt_cb.best_model_path)
+        print("Best val/R@1:", float(ckpt_cb.best_model_score) if ckpt_cb.best_model_score is not None else None)
 
 
 if __name__ == "__main__":
