@@ -514,7 +514,7 @@ class DinoCrossViewRetrieverST2(pl.LightningModule):
         r1r = recall_at_k(preds_r, gt, 1)
         r5r = recall_at_k(preds_r, gt, 5)
         r10r = recall_at_k(preds_r, gt, 10)
-        self.log("val/R@1_patch", float(r1r), sync_dist=False)
+        self.log("val/R@1_reranked", float(r1r), sync_dist=False)
         gap_r = 0.90 - r1r
         print(f"[VAL patch-reranked K={K} α={alpha}] R@1={r1r:.4f} R@5={r5r:.4f} R@10={r10r:.4f} | gap_to_90={gap_r:.4f}")
 
