@@ -378,6 +378,7 @@ class DinoCrossViewRetriever(pl.LightningModule):
         pos_mask = self._build_pos_mask(uav_coords, sat_coords)
         loss = self._multi_pos_infonce(q, k, pos_mask)
         self.log("train/loss", loss, on_step=True, on_epoch=True, prog_bar=True, batch_size=uav.size(0))
+        self.log("train/loss_infonce", loss, on_step=True, on_epoch=True, prog_bar=False, batch_size=uav.size(0))
         self.log("train/logit_scale", self.logit_scale.exp(), on_step=True, on_epoch=False, prog_bar=False)
         return loss
 

@@ -431,6 +431,7 @@ class DinoCrossViewRetrieverST2(pl.LightningModule):
         pos_mask, ignore_mask = self._build_masks(uav_coords, sat_coords)
         loss = self._smooth_ap_loss(q, k, pos_mask, ignore_mask)
         self.log("train/loss", loss, on_step=True, on_epoch=True, prog_bar=True, batch_size=uav.size(0))
+        self.log("train/loss_smooth_ap", loss, on_step=True, on_epoch=True, prog_bar=False, batch_size=uav.size(0))
         return loss
 
     def on_validation_epoch_start(self):
