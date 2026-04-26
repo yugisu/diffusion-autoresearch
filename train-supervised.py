@@ -542,8 +542,9 @@ def main():
         log_model=False,
     )
 
+    ckpt_dir = f"checkpoints/{cfg.wandb_run_name}" if cfg.wandb_run_name else "checkpoints/supervised-unnamed"
     ckpt_cb = ModelCheckpoint(
-        dirpath="checkpoints/supervised-dinov3",
+        dirpath=ckpt_dir,
         monitor="val/R@1",
         mode="max",
         save_top_k=1,
