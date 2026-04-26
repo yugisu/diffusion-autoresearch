@@ -21,9 +21,10 @@ from torch.utils.data import Dataset
 # ---------------------------------------------------------------------------
 
 VISLOC_ROOT = Path("/workspace/data/visloc")
+SSL4EOS12_ROOT = Path("/workspace/data/SSL4EOS12")
 HF_HOME = "/workspace/.hugging_face"
 FLIGHT_ID = "03"
-TIME_BUDGET = 720  # seconds (12 minutes wall-clock budget per experiment)
+TIME_BUDGET = 2700  # seconds (45 minutes wall-clock budget per experiment)
 
 # Satellite gallery config — fixed for fair comparison across runs.
 # These define the retrieval database: 2860 chunks at 512px with 128-px stride.
@@ -31,11 +32,25 @@ CHUNK_PIXELS = 512
 CHUNK_STRIDE = 128
 MAP_SCALE_FACTOR = 0.25
 
+SAT_SCALES = {
+    "01": 0.25,
+    "02": 0.25,
+    "03": 0.25,
+    "04": 0.25,
+    "05": 0.40,
+    "06": 0.60,
+    "08": 0.35,
+    "09": 0.25,
+    "10": 0.50,
+    "11": 0.25,
+}
+
 os.environ["HF_HOME"] = HF_HOME
 
 # ---------------------------------------------------------------------------
 # Dataset classes
 # ---------------------------------------------------------------------------
+
 
 def _read_sat_bounds(root: Path, flight_id: str) -> tuple[float, float, float, float]:
     """Returns (lat_min, lon_min, lat_max, lon_max) from the VisLoc coordinates CSV."""
@@ -120,8 +135,8 @@ class SatChunkDataset(Dataset):
                 self._chunks.append((x, y, lat, lon))
                 self._bboxes.append((
                     lat_max - ((y + chunk_pixels) / h) * (lat_max - lat_min),  # lat_min of chunk
-                    lon_min + (x / w) * (lon_max - lon_min),                   # lon_min of chunk
-                    lat_max - (y / h) * (lat_max - lat_min),                   # lat_max of chunk
+                    lon_min + (x / w) * (lon_max - lon_min),  # lon_min of chunk
+                    lat_max - (y / h) * (lat_max - lat_min),  # lat_max of chunk
                     lon_min + ((x + chunk_pixels) / w) * (lon_max - lon_min),  # lon_max of chunk
                 ))
 
@@ -138,7 +153,7 @@ class SatChunkDataset(Dataset):
 
     def __getitem__(self, idx: int):
         x, y, lat, lon = self._chunks[idx]
-        crop = self._img[y:y + self.chunk_pixels, x:x + self.chunk_pixels]
+        crop = self._img[y : y + self.chunk_pixels, x : x + self.chunk_pixels]
         img = Image.fromarray(crop)
         if self.transform is not None:
             img = self.transform(img)
@@ -149,11 +164,12 @@ class SatChunkDataset(Dataset):
 # Evaluation (DO NOT CHANGE — this is the fixed metric)
 # ---------------------------------------------------------------------------
 
+
 def _flat_earth_dist_m(lat1: float, lon1: float, lats: np.ndarray, lons: np.ndarray) -> np.ndarray:
     """Approximate flat-earth distance in metres from one point to an array of points."""
     dlat = (lats - lat1) * 111_111
     dlon = (lons - lon1) * 111_111 * np.cos(np.radians(lat1))
-    return np.sqrt(dlat ** 2 + dlon ** 2)
+    return np.sqrt(dlat**2 + dlon**2)
 
 
 def build_ground_truth(
@@ -215,12 +231,12 @@ def evaluate_r1(
     sat_n = sat_embs.astype(np.float32)
     uav_n /= np.linalg.norm(uav_n, axis=1, keepdims=True) + 1e-8
     sat_n /= np.linalg.norm(sat_n, axis=1, keepdims=True) + 1e-8
-    sim = uav_n @ sat_n.T          # (N_uav, N_sat) cosine similarity
+    sim = uav_n @ sat_n.T  # (N_uav, N_sat) cosine similarity
     preds = np.argsort(-sim, axis=1)  # descending rank
     gt = build_ground_truth(uav_coords, chunk_bboxes)
     return {
-        "R@1":  recall_at_k(preds, gt, 1),
-        "R@5":  recall_at_k(preds, gt, 5),
+        "R@1": recall_at_k(preds, gt, 1),
+        "R@5": recall_at_k(preds, gt, 5),
         "R@10": recall_at_k(preds, gt, 10),
     }
 
@@ -230,10 +246,11 @@ def evaluate_r1(
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    print(f"VISLOC_ROOT : {VISLOC_ROOT}")
-    print(f"HF_HOME     : {HF_HOME}")
-    print(f"FLIGHT_ID   : {FLIGHT_ID}")
-    print(f"TIME_BUDGET : {TIME_BUDGET}s")
+    print(f"VISLOC_ROOT    : {VISLOC_ROOT}")
+    print(f"SSL4EOS12_ROOT : {SSL4EOS12_ROOT}")
+    print(f"HF_HOME        : {HF_HOME}")
+    print(f"FLIGHT_ID      : {FLIGHT_ID}")
+    print(f"TIME_BUDGET    : {TIME_BUDGET}s")
     print()
 
     print("Loading UAV dataset...")
