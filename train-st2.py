@@ -34,6 +34,7 @@ from __future__ import annotations
 import argparse
 import os
 import random
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List
@@ -43,7 +44,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint
+from lightning.pytorch.callbacks import ModelCheckpoint
 from lightning.pytorch.loggers import WandbLogger
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
@@ -110,6 +111,7 @@ class Config:
 
     wandb_project: str = "dinov3-ft-evaluate-ssl-efficiency"
     wandb_run_name: str | None = None
+    notes: str = ""
 
 
 # -----------------------------------------------------------------------------
@@ -333,6 +335,10 @@ class DinoCrossViewRetrieverST2(pl.LightningModule):
         self._val_uav_embs: list = []
         self._val_sat_embs: list = []
         self._val_uav_coords: list = []
+        self._best_r1 = 0.0
+        self._best_r5 = 0.0
+        self._best_r10 = 0.0
+        self._best_epoch = 0
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
         out = self.backbone(pixel_values=x)
@@ -468,6 +474,13 @@ class DinoCrossViewRetrieverST2(pl.LightningModule):
         self.log("val/R@1", float(metrics["R@1"]), prog_bar=True, sync_dist=False)
         self.log("val/R@5", float(metrics["R@5"]), sync_dist=False)
         self.log("val/R@10", float(metrics["R@10"]), sync_dist=False)
+
+        if float(metrics["R@1"]) > self._best_r1:
+            self._best_r1 = float(metrics["R@1"])
+            self._best_r5 = float(metrics["R@5"])
+            self._best_r10 = float(metrics["R@10"])
+            self._best_epoch = self.current_epoch
+
         gap = 0.90 - float(metrics["R@1"])
         print(
             f"[VAL flight {VAL_FLIGHT}] R@1={metrics['R@1']:.4f} R@5={metrics['R@5']:.4f} R@10={metrics['R@10']:.4f} | gap_to_90={gap:.4f}"
@@ -536,6 +549,19 @@ class DinoCrossViewRetrieverST2(pl.LightningModule):
 # -----------------------------------------------------------------------------
 
 
+def _append_results_tsv(run_name, method_name, seed, r1, r5, r10, best_epoch, elapsed_s, notes=""):
+    path = Path("results.tsv")
+    if not path.exists():
+        path.write_text("run_name\tmethod_name\tseed\tR@1\tR@5\tR@10\tbest_epoch\telapsed_s\tnotes\n")
+    with open(path, "a") as f:
+        f.write(f"{run_name}\t{method_name}\t{seed}\t{r1:.4f}\t{r5:.4f}\t{r10:.4f}\t{best_epoch}\t{elapsed_s:.0f}\t{notes}\n")
+    print(
+        f"\n[RESULTS] {run_name} | {method_name} | seed={seed}"
+        f" | R@1={r1:.4f} R@5={r5:.4f} R@10={r10:.4f}"
+        f" | best_epoch={best_epoch} | elapsed={elapsed_s:.0f}s"
+    )
+
+
 def parse_args() -> Config:
     parser = argparse.ArgumentParser(description="Stage-2: supervised DINOv3 SFT from SSL4EO-S12 SSL checkpoint")
     parser.add_argument("--visloc-root", type=str, default=Config.visloc_root)
@@ -557,6 +583,7 @@ def parse_args() -> Config:
     parser.add_argument("--wandb-run-name", type=str, default=None)
     parser.add_argument("--sft-ckpt", type=str, default="", help="SFT checkpoint for --eval-only mode")
     parser.add_argument("--eval-only", action="store_true", help="Skip training; validate with --sft-ckpt")
+    parser.add_argument("--notes", type=str, default="")
     args = parser.parse_args()
 
     return Config(
@@ -579,6 +606,7 @@ def parse_args() -> Config:
         seed=args.seed,
         wandb_project=args.wandb_project,
         wandb_run_name=args.wandb_run_name,
+        notes=args.notes,
     )
 
 
@@ -625,8 +653,6 @@ def main():
         mode="max",
         save_top_k=1,
     )
-    early_stop_cb = EarlyStopping(monitor="val/R@1", mode="max", patience=6)
-
     trainer = pl.Trainer(
         accelerator="auto",
         devices=1,
@@ -634,7 +660,7 @@ def main():
         max_steps=cfg.max_steps,
         precision=cfg.precision,
         logger=wandb_logger,
-        callbacks=[ckpt_cb, early_stop_cb],
+        callbacks=[ckpt_cb],
         log_every_n_steps=5,
         benchmark=True,
         gradient_clip_val=1.0,
@@ -645,9 +671,26 @@ def main():
         print(f"[eval-only] loading SFT checkpoint: {ckpt}")
         trainer.validate(model, datamodule=datamodule, ckpt_path=ckpt)
     else:
+        t0 = time.time()
         trainer.fit(model, datamodule=datamodule)
+        elapsed_s = time.time() - t0
+
         print("Best checkpoint:", ckpt_cb.best_model_path)
         print("Best val/R@1:", float(ckpt_cb.best_model_score) if ckpt_cb.best_model_score is not None else None)
+
+        run_name = cfg.wandb_run_name or "unnamed"
+        method_name = f"st2-{cfg.backbone_init}"
+        _append_results_tsv(
+            run_name,
+            method_name,
+            cfg.seed,
+            model._best_r1,
+            model._best_r5,
+            model._best_r10,
+            model._best_epoch,
+            elapsed_s,
+            cfg.notes,
+        )
 
 
 if __name__ == "__main__":

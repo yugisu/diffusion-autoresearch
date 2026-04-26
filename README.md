@@ -9,12 +9,24 @@ TODO:
 - run the best training stage-2 routine on the base model (creating a new supervised baseline)
 - run the best training supervised baseline routine on the SSL-tuned model (evaluating efficacy of the supervised baseline training)
 - repeat above for different seeds - 42, 122, 234
-- for each run report: run_id, method_name, seed, "R@1", "R@5", "R@10", "Dis@1", "Dis@5", "Dis@10", best_epoch, elapsed_s, notes
+- for each run report: run_name, method_name, seed, "R@1", "R@5", "R@10", best_epoch, elapsed_s, notes
 - total of 6 runs: (supervised routine x {base, SSL}, stage-2 routine x {base, SSL}) x seed {42, 122, 234}
 - aggregate the results, report comparison of efficacy of either method on each stage with mean metrics+-std
+
+table of experiments:
+- E1-s42-base-model-supervised-routine
+- E2-s42-ssl-model-st2-routine
+- E3-s42-ssl-model-supervised-routine
+- E4-s42-base-model-st2-routine
 
 set variables:
 - Dataset split: VisLoc flight 03 validation (same query/gallery as prior reports)
 - Input resolution: 336 x 336
 - Evaluation script/path: same code path and metric implementation for both stages
 - Hardware target: single A100 80GB (or same GPU type across all runs)
+
+how to run all experiments
+```
+tmux new -s experiments
+bash run_experiments.sh 2>&1 | tee experiments.log
+```

@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import os
 import random
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List
@@ -29,7 +30,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint
+from lightning.pytorch.callbacks import ModelCheckpoint
 from lightning.pytorch.loggers import WandbLogger
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, CosineAnnealingWarmRestarts, LinearLR, SequentialLR
@@ -43,6 +44,7 @@ from prepare import (
     CHUNK_PIXELS,
     CHUNK_STRIDE,
     MAP_SCALE_FACTOR,
+    SAT_SCALES,
     VISLOC_ROOT,
     SatChunkDataset,
     UAVDataset,
@@ -61,18 +63,6 @@ SSL_CKPT_DEFAULT = DEFAULT_SSL_CKPT
 TRAIN_FLIGHTS = ["01", "02", "04", "05", "06", "08", "09", "10", "11"]
 VAL_FLIGHT = "03"
 
-SAT_SCALES = {
-    "01": 0.25,
-    "02": 0.25,
-    "03": 0.25,
-    "04": 0.25,
-    "05": 0.40,
-    "06": 0.60,
-    "08": 0.35,
-    "09": 0.25,
-    "10": 0.50,
-    "11": 0.25,
-}
 
 DEFAULT_BATCH_SIZE = 128
 DEFAULT_EVAL_BATCH_SIZE = 128
@@ -96,13 +86,14 @@ class Config:
     weight_decay: float = 1e-4
     temperature: float = 0.07
 
-    max_epochs: int = 20
+    max_epochs: int = 25
     max_steps: int = -1
     precision: str = "16-mixed"
     seed: int = 42
 
     wandb_project: str = "dinov3-ft-evaluate-ssl-efficiency"
     wandb_run_name: str | None = None
+    notes: str = ""
 
 
 # -----------------------------------------------------------------------------
@@ -337,6 +328,10 @@ class DinoCrossViewRetriever(pl.LightningModule):
         self._val_uav_embs = []
         self._val_sat_embs = []
         self._val_uav_coords = []
+        self._best_r1 = 0.0
+        self._best_r5 = 0.0
+        self._best_r10 = 0.0
+        self._best_epoch = 0
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
         out = self.backbone(pixel_values=x)
@@ -422,6 +417,12 @@ class DinoCrossViewRetriever(pl.LightningModule):
         self.log("val/R@5", float(metrics["R@5"]), prog_bar=False, sync_dist=False)
         self.log("val/R@10", float(metrics["R@10"]), prog_bar=False, sync_dist=False)
 
+        if float(metrics["R@1"]) > self._best_r1:
+            self._best_r1 = float(metrics["R@1"])
+            self._best_r5 = float(metrics["R@5"])
+            self._best_r10 = float(metrics["R@10"])
+            self._best_epoch = self.current_epoch
+
         gap = 0.90 - float(metrics["R@1"])
         print(
             f"[VAL flight {VAL_FLIGHT}] R@1={metrics['R@1']:.4f} R@5={metrics['R@5']:.4f} R@10={metrics['R@10']:.4f} | gap_to_90={gap:.4f}"
@@ -461,6 +462,19 @@ class DinoCrossViewRetriever(pl.LightningModule):
 # -----------------------------------------------------------------------------
 
 
+def _append_results_tsv(run_name, method_name, seed, r1, r5, r10, best_epoch, elapsed_s, notes=""):
+    path = Path("results.tsv")
+    if not path.exists():
+        path.write_text("run_name\tmethod_name\tseed\tR@1\tR@5\tR@10\tbest_epoch\telapsed_s\tnotes\n")
+    with open(path, "a") as f:
+        f.write(f"{run_name}\t{method_name}\t{seed}\t{r1:.4f}\t{r5:.4f}\t{r10:.4f}\t{best_epoch}\t{elapsed_s:.0f}\t{notes}\n")
+    print(
+        f"\n[RESULTS] {run_name} | {method_name} | seed={seed}"
+        f" | R@1={r1:.4f} R@5={r5:.4f} R@10={r10:.4f}"
+        f" | best_epoch={best_epoch} | elapsed={elapsed_s:.0f}s"
+    )
+
+
 def parse_args() -> Config:
     parser = argparse.ArgumentParser(description="Supervised DINOv3 fine-tuning for VisLoc retrieval")
 
@@ -485,6 +499,7 @@ def parse_args() -> Config:
     parser.add_argument("--model-name", type=str, default=DINO_MODEL)
     parser.add_argument("--backbone-init", type=str, choices=["base", "ssl"], default=Config.backbone_init)
     parser.add_argument("--ssl-ckpt", type=str, default=Config.ssl_ckpt)
+    parser.add_argument("--notes", type=str, default="")
 
     args = parser.parse_args()
 
@@ -507,6 +522,7 @@ def parse_args() -> Config:
         seed=args.seed,
         wandb_project=args.wandb_project,
         wandb_run_name=args.wandb_run_name,
+        notes=args.notes,
     )
     return cfg
 
@@ -549,8 +565,6 @@ def main():
         mode="max",
         save_top_k=1,
     )
-    early_stop_cb = EarlyStopping(monitor="val/R@1", mode="max", patience=6)
-
     trainer = pl.Trainer(
         accelerator="auto",
         devices=1,
@@ -558,15 +572,31 @@ def main():
         max_steps=cfg.max_steps,
         precision=cfg.precision,
         logger=wandb_logger,
-        callbacks=[ckpt_cb, early_stop_cb],
+        callbacks=[ckpt_cb],
         log_every_n_steps=5,
         benchmark=True,
     )
 
+    t0 = time.time()
     trainer.fit(model, datamodule=datamodule)
+    elapsed_s = time.time() - t0
 
     print("Best checkpoint:", ckpt_cb.best_model_path)
     print("Best val/R@1:", float(ckpt_cb.best_model_score) if ckpt_cb.best_model_score is not None else None)
+
+    run_name = cfg.wandb_run_name or "unnamed"
+    method_name = f"supervised-{cfg.backbone_init}"
+    _append_results_tsv(
+        run_name,
+        method_name,
+        cfg.seed,
+        model._best_r1,
+        model._best_r5,
+        model._best_r10,
+        model._best_epoch,
+        elapsed_s,
+        cfg.notes,
+    )
 
 
 if __name__ == "__main__":
