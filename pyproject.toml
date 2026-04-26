@@ -4,8 +4,8 @@ version = "0.1.0"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "torch>=2.2.0",
-    "torchvision",
+    "torch==2.3.1",
+    "torchvision==0.18.1",
     "numpy>=1.26.3,<2",
     "pillow>=12.1.1",
     "rasterio>=1.4.4",
@@ -13,11 +13,19 @@ dependencies = [
     "tqdm>=4.67.3",
     "matplotlib>=3.10.0",
     "scikit-learn>=1.5.0",
-    "diffusers==0.17.0",
-    "transformers==4.40.0",
-    "huggingface-hub==0.19.3",
-    "accelerate==0.18.0",
-    "xformers==0.0.25.post1",
+    "transformers==4.56.0",
+    "huggingface-hub==0.34.4",
+    "accelerate==0.34.2",
+    "lightning>=2.2.0",
+    "wandb>=0.17.0",
+    "ipykernel>=7.2.0",
+    "zarr>=2.18.3",
+    "fsspec>=2026.2.0",
+    "webdataset>=1.0.2",
+    "braceexpand>=0.1.7",
+    "einops>=0.8.2",
+    "albumentations>=2.0.8",
+    "pyarrow>=24.0.0",
 ]
 
 [tool.uv.sources]
@@ -27,6 +35,3 @@ torch = [{ index = "pytorch-cu121" }]
 name = "pytorch-cu121"
 url = "https://download.pytorch.org/whl/cu121"
 explicit = true
-
-[tool.uv.extra-build-dependencies]
-xformers = ["torch"]
