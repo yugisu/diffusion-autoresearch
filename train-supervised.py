@@ -480,7 +480,7 @@ def parse_args() -> Config:
     parser.add_argument("--precision", type=str, default=Config.precision)
     parser.add_argument("--seed", type=int, default=Config.seed)
 
-    parser.add_argument("--wandb-project", type=str, default="autoresearch-supervised-dinov3")
+    parser.add_argument("--wandb-project", type=str, default=Config.wandb_project)
     parser.add_argument("--wandb-run-name", type=str, default=None)
     parser.add_argument("--model-name", type=str, default=DINO_MODEL)
     parser.add_argument("--backbone-init", type=str, choices=["base", "ssl"], default=Config.backbone_init)
