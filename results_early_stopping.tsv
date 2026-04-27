@@ -1,0 +1,8 @@
+run_name	method_name	seed	R@1	R@5	R@10	best_epoch	elapsed_s	notes
+E1-s42-base-model-supervised-routine	supervised-base	42	0.7357	0.8815	0.9323	10	2300
+E2-s42-ssl-model-st2-routine	st2-ssl	42	0.8073	0.9128	0.9518	2	1686
+E3-s42-ssl-model-supervised-routine	supervised-ssl	42	0.7786	0.9089	0.9375	10	2177
+E4-s42-base-model-st2-routine	st2-base	42	0.7878	0.8984	0.9362	22	3492
+E1-s122-base-model-supervised-routine	supervised-base	122	0.7318	0.8594	0.9141	7	2027
+E2-s122-ssl-model-st2-routine	st2-ssl	122	0.7747	0.8880	0.9310	3	1812
+E3-s122-ssl-model-supervised-routine	supervised-ssl	122	0.7617	0.8841	0.9284	8	2169
